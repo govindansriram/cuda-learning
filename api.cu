@@ -8,7 +8,6 @@ __global__ void vector_add_kernel(const float *d_a, const float *d_b, float *d_c
     if (current_thread < elements) d_c[current_thread] = d_a[current_thread] + d_b[current_thread];
 }
 
-// install and use opencv
 __global__ void picture_kernel(const float *d_pin, float *d_pout, int const n, int const m) {
     unsigned int current_row{blockIdx.y * blockDim.y + threadIdx.y};
     unsigned int current_col{blockIdx.x * blockDim.x + threadIdx.x};
@@ -38,6 +37,15 @@ __global__ void transpose_matrix_kernel(const unsigned char *d_pin, unsigned cha
     }
 }
 
+__global__ void transpose_cv_image_kernel(const unsigned char *d_pin, unsigned char *d_pout, int const columns, int const rows, int const channels, int const in_skip, int const out_skip) {
+    unsigned int const current_row{blockIdx.y * blockDim.y + threadIdx.y};
+    unsigned int const current_col{blockIdx.x * blockDim.x + threadIdx.x};
+
+    if (current_row < rows && current_col < columns) {
+        for (size_t i{0}; i < channels; ++i) d_pout[(current_col * out_skip) + (current_row * channels) + i] = d_pin[(current_row * in_skip) + (current_col * channels) + i];
+    }
+}
+
 cv::Mat transpose_opencv_image(cv::Mat const &image) {
     cv::Mat transposed(image.cols, image.rows, image.type());
 
@@ -50,11 +58,17 @@ cv::Mat transpose_opencv_image(cv::Mat const &image) {
 
     constexpr dim3 block_dim(16, 16);
     dim3 grid_dim(
-        std::ceil(static_cast<float>(image.cols * image.channels()) / block_dim.x),
+        std::ceil(static_cast<float>(image.cols) / block_dim.x),
         std::ceil(static_cast<float>(image.rows) / block_dim.x)
         );
 
-    transpose_matrix_kernel<<<grid_dim, block_dim>>>(dsource_ptr, ddest_Ptr, image.cols * image.channels(), image.rows);
+    transpose_cv_image_kernel<<<grid_dim, block_dim>>>(dsource_ptr, ddest_Ptr, image.cols, image.rows, image.channels(), image.step, transposed.step);
+
+    cudaDeviceSynchronize(); // Force flush of printf buffer
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        std::cerr << "CUDA error: " << cudaGetErrorString(error) << std::endl;
+    }
 
     cudaMemcpy(transposed.data, ddest_Ptr, transposed.step * transposed.rows, cudaMemcpyDeviceToHost);
 
