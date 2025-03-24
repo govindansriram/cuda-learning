@@ -8,20 +8,23 @@
 
 int main() {
 
-    float mat1[]{
-        1, 2, 3,
-        4, 5, 6,
-        7, 8, 9,
-        10, 11, 12};
-
-    float mat2[]{
+    float mat1[] {
         1, 2, 3, 4,
         5, 6, 7, 8,
-        9, 10, 11, 12};
+        9, 10, 11, 12,
+        13, 14, 15, 16
+    };
 
-    float dest[16]{};
+    float mat2[]{
+        1, 2,
+        3, 4,
+        5, 6,
+        7, 8
+    };
 
-    matmul(mat1, mat2, dest, 4, 3, 4);
+    float dest[8]{};
+
+    tiled_matmul(mat1, mat2, dest, 4, 4, 2);
 
     for (float const &num: dest) {
         std::cout << num << std::endl;

@@ -62,6 +62,93 @@ __global__ void mat_mul(const float * mat1, const float * mat2, float * dest_mat
     }
 }
 
+// requires matrices perfectly divisible by TILE_WIDTH
+#define TILE_WIDTH 2
+__global__ void tiled_mat_mul(const float * mat1, const float * mat2, float * dest_mat, const size_t mat_1_width) {
+
+    const unsigned int curr_col{threadIdx.x};
+    const unsigned int curr_row = {threadIdx.y};
+    const unsigned int dest_column{blockIdx.x * TILE_WIDTH + curr_col};
+    const unsigned int dest_row{blockIdx.y * TILE_WIDTH + curr_row};
+
+    const unsigned int mat_2_width{gridDim.x * TILE_WIDTH};
+
+    __shared__ float row_arr[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float column_arr[TILE_WIDTH][TILE_WIDTH];
+
+    float partial{0};
+
+    for (int m = 0; m < mat_1_width / TILE_WIDTH; ++m) {
+        row_arr[curr_row][curr_col] = mat1[mat_1_width * dest_row + m * TILE_WIDTH + curr_col];
+        column_arr[curr_row][curr_col] = mat2[(TILE_WIDTH * m + curr_row) * mat_2_width + dest_column];
+        __syncthreads();
+
+        for (int i{0}; i < TILE_WIDTH; ++i) {
+            partial += row_arr[curr_row][i] * column_arr[i][curr_col];
+        }
+        __syncthreads();
+    }
+
+    dest_mat[dest_row * mat_2_width + dest_column] = partial;
+}
+
+__global__ void gemv(const float * matrix, const float * vector, float * result, const int result_len, const int mat_cols) {
+
+    const unsigned int curr_col{threadIdx.x};
+    const unsigned int dest_col{blockIdx.x * TILE_WIDTH + curr_col};
+
+    __shared__ float vector_arr[TILE_WIDTH];
+
+    float partial{0};
+
+    for (int i{0}; i < mat_cols / TILE_WIDTH; ++i) {
+        vector_arr[curr_col] = vector[i * TILE_WIDTH + curr_col];
+        __syncthreads();
+
+        for (size_t k = 0; k < TILE_WIDTH; ++k) partial += vector_arr[k] * matrix[mat_cols * dest_col + i * TILE_WIDTH + k];
+        __syncthreads();
+    }
+
+    result[dest_col] += partial;
+}
+
+void tiled_gemv(const float * matrix, const float * vector, float * dest_result, size_t const result_len, size_t const vector_len) {
+
+}
+
+void tiled_matmul(const float * mat1, const float * mat2, float * dest_mat, size_t const mat1_rows, size_t const shared_dim, size_t const mat2_columns) {
+
+    float * d_mat1;
+    float * d_mat2;
+    float * d_dest;
+
+    cudaMalloc(&d_mat1, sizeof(float) * mat1_rows * shared_dim);
+    cudaMalloc(&d_mat2, sizeof(float) * mat2_columns * shared_dim);
+    cudaMalloc(&d_dest, sizeof(float) * mat1_rows * mat2_columns);
+
+    cudaMemcpy(d_mat1, mat1, sizeof(float) * mat1_rows * shared_dim,  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_mat2, mat2, sizeof(float) * mat2_columns * shared_dim,  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_dest, dest_mat, sizeof(float) * mat2_columns * mat1_rows,  cudaMemcpyHostToDevice);
+
+    constexpr dim3 block_dim(TILE_WIDTH, TILE_WIDTH);
+    dim3 grid_dim(
+        mat2_columns / TILE_WIDTH, mat1_rows / TILE_WIDTH);
+
+    tiled_mat_mul<<<grid_dim, block_dim>>>(d_mat1, d_mat2, d_dest, mat1_rows);
+
+    cudaDeviceSynchronize(); // Force flush of printf buffer
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        std::cerr << "CUDA error: " << cudaGetErrorString(error) << std::endl;
+    }
+
+    cudaMemcpy(dest_mat, d_dest, sizeof(float) * mat2_columns * mat1_rows,  cudaMemcpyDeviceToHost);
+
+    cudaFree(d_mat1);
+    cudaFree(d_mat2);
+    cudaFree(d_dest);
+}
+
 void matmul(const float * mat1, const float * mat2, float * dest_mat, size_t const mat1_rows, size_t const shared_dim, size_t const mat2_columns) {
 
     float * d_mat1;

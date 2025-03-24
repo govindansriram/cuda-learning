@@ -58,6 +58,8 @@ void picture_kernel_wrapper();
 void transpose_wrapper(unsigned char * data, size_t rows, size_t columns);
 cv::Mat transpose_opencv_image(cv::Mat const &image);
 void matmul(const float * mat1, const float * mat2, float * dest_mat, size_t mat1_rows, size_t shared_dim, size_t mat2_columns);
+void tiled_matmul(const float * mat1, const float * mat2, float * dest_mat, size_t mat1_rows, size_t shared_dim, size_t mat2_columns);
+
 
 
 #endif //API_H
