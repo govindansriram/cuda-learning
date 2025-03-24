@@ -7,15 +7,35 @@
 #include <opencv2/opencv.hpp>
 
 int main() {
-    cv::Mat const img{cv::imread("/home/sriram/Pictures/maxresdefault.jpg")};
-    std::cout << img.rows << std::endl;
-    std::cout << img.cols << std::endl;
-    std::cout << img.step << std::endl;
+
+    float mat1[]{
+        1, 2, 3,
+        4, 5, 6,
+        7, 8, 9,
+        10, 11, 12};
+
+    float mat2[]{
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+        9, 10, 11, 12};
+
+    float dest[16]{};
+
+    matmul(mat1, mat2, dest, 4, 3, 4);
+
+    for (float const &num: dest) {
+        std::cout << num << std::endl;
+    }
+
+    // cv::Mat const img{cv::imread("/home/sriram/Pictures/maxresdefault.jpg")};
+    // std::cout << img.rows << std::endl;
+    // std::cout << img.cols << std::endl;
+    // std::cout << img.step << std::endl;
 
     // cv::imshow("display the image", img);
     // cv::waitKey(0);  // 0 means wait indefinitely until a key is pressed
 
-    cv::Mat const ti{transpose_opencv_image(img)};
+    // cv::Mat const ti{transpose_opencv_image(img)};
 
     // cv::imshow("display the image", ti);
     // cv::waitKey(0);  // 0 means wait indefinitely until a key is pressed

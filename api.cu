@@ -46,6 +46,57 @@ __global__ void transpose_cv_image_kernel(const unsigned char *d_pin, unsigned c
     }
 }
 
+// first mat, m x n; second mat n x m final mat
+__global__ void mat_mul(const float * mat1, const float * mat2, float * dest_mat, size_t const mat1_rows, size_t const shared_dim, size_t const mat2_columns) {
+    unsigned int const column{blockDim.x * blockIdx.x + threadIdx.x};
+    unsigned int const row{blockDim.y * blockIdx.y + threadIdx.y};
+
+    if (column < mat2_columns && row < mat1_rows) {
+        float sum{0};
+
+        for (size_t i = 0; i < shared_dim; ++i) {
+            sum += mat1[row * shared_dim + i] * mat2[i * mat2_columns + column];
+        }
+
+        dest_mat[mat2_columns * row + column] = sum;
+    }
+}
+
+void matmul(const float * mat1, const float * mat2, float * dest_mat, size_t const mat1_rows, size_t const shared_dim, size_t const mat2_columns) {
+
+    float * d_mat1;
+    float * d_mat2;
+    float * d_dest;
+
+    cudaMalloc(&d_mat1, sizeof(float) * mat1_rows * shared_dim);
+    cudaMalloc(&d_mat2, sizeof(float) * mat2_columns * shared_dim);
+    cudaMalloc(&d_dest, sizeof(float) * mat1_rows * mat2_columns);
+
+    cudaMemcpy(d_mat1, mat1, sizeof(float) * mat1_rows * shared_dim,  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_mat2, mat2, sizeof(float) * mat2_columns * shared_dim,  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_dest, dest_mat, sizeof(float) * mat2_columns * mat1_rows,  cudaMemcpyHostToDevice);
+
+    constexpr dim3 block_dim(16, 16);
+    dim3 grid_dim(
+        std::ceil(static_cast<float>(mat2_columns) / block_dim.x),
+        std::ceil(static_cast<float>(mat1_rows) / block_dim.y)
+        );
+
+    mat_mul<<<grid_dim, block_dim>>>(d_mat1, d_mat2, d_dest, mat1_rows, shared_dim, mat2_columns);
+
+    cudaDeviceSynchronize(); // Force flush of printf buffer
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        std::cerr << "CUDA error: " << cudaGetErrorString(error) << std::endl;
+    }
+
+    cudaMemcpy(dest_mat, d_dest, sizeof(float) * mat2_columns * mat1_rows,  cudaMemcpyDeviceToHost);
+
+    cudaFree(d_mat1);
+    cudaFree(d_mat2);
+    cudaFree(d_dest);
+}
+
 cv::Mat transpose_opencv_image(cv::Mat const &image) {
     cv::Mat transposed(image.cols, image.rows, image.type());
 
