@@ -356,3 +356,24 @@ void vadd_wrapper() {
         std::cout << std::fixed << std::setprecision(2) << i << std::endl;
     }
 }
+
+void get_device_settings() {
+    int dev_count;
+    cudaGetDeviceCount( &dev_count);
+
+    // std::cout << dev_count;
+    cudaDeviceProp dev_prop;
+    for (int i = 0; i < dev_count; ++i) {
+        cudaGetDeviceProperties( &dev_prop, i);
+        std::cout << "warp size: " <<  dev_prop.warpSize << std::endl;
+        std::cout << "max threads per block: " <<  dev_prop.maxThreadsPerBlock << std::endl;
+        std::cout << "shared memory per block: " <<  dev_prop.sharedMemPerBlock << std::endl;
+        std::cout << "shared memory per multiprocessor: " <<  dev_prop.sharedMemPerMultiprocessor << std::endl;
+        std::cout << "total global memory: " <<  dev_prop.totalGlobalMem << std::endl;
+        std::cout << "multiprocessor count: " <<  dev_prop.multiProcessorCount << std::endl;
+        std::cout << "threads per multiprocessor: " <<  dev_prop.maxThreadsPerMultiProcessor << std::endl;
+        std::cout << "device name: " <<  dev_prop.name << std::endl;
+        std::cout << "version: " << dev_prop.major << "." << dev_prop.minor << std::endl;
+        // decide if device has sufficient resources and capabilities
+    }
+}
