@@ -75,7 +75,9 @@ __device__ __forceinline__ void consumer(
     float B_buffer[2][TILE_SIZE_K][TILE_SIZE_X],
     float *mat_C,
     const size_t thread_linear_idx,
-    const size_t C_stride) {
+    const size_t C_stride,
+    const size_t M,
+    const size_t N) {
     // signal we are ready for the initial shared memory filling
     barrier::arrival_token token1{ready[0].arrive()};
     barrier::arrival_token token2{ready[1].arrive()};
@@ -84,6 +86,9 @@ __device__ __forceinline__ void consumer(
 
     size_t row{thread_linear_idx / TILE_SIZE_X};
     size_t column{thread_linear_idx % TILE_SIZE_X};
+
+    const size_t C_row{TILE_SIZE_Y * blockIdx.y + row};
+    const size_t C_column{blockIdx.x * TILE_SIZE_X + column};
 
     for (size_t iter{0}; iter < iterations; ++iter) {
         // alternate the buffers being used
@@ -101,7 +106,9 @@ __device__ __forceinline__ void consumer(
         barrier::arrival_token token{ready[selected_buffer].arrive()};
     }
 
-    mat_C[(TILE_SIZE_Y * blockIdx.y + row) * C_stride + blockIdx.x * TILE_SIZE_X + column] = partial;
+    if (C_row < M && C_column < N) {
+        mat_C[C_row * C_stride + C_column] = partial;
+    }
 }
 
 template<
@@ -166,7 +173,6 @@ __global__ void producer_consumer_pattern(
     const size_t A_stride,
     const size_t B_stride,
     const size_t C_stride) {
-    auto block = cooperative_groups::this_thread_block();
 
     // CONSUMER_WARPS will handle processing the data
     // PRODUCER_WARPS will handle writing the data to memory
@@ -179,6 +185,7 @@ __global__ void producer_consumer_pattern(
     __shared__ float B_buffer[2][TILE_SIZE_K][TILE_SIZE_X];
     __shared__ barrier bar[4];
 
+    auto block = cooperative_groups::this_thread_block();
     constexpr size_t producer_threads_per_block{WARP_SIZE * PRODUCER_WARPS};
     constexpr size_t consumer_threads_per_block{WARP_SIZE * CONSUMER_WARPS};
 
@@ -187,12 +194,12 @@ __global__ void producer_consumer_pattern(
     // initialization
     if (block.thread_rank() == 0) {
         // tracks if a buffer is ready to be filled
-        init(&bar[0], consumer_threads_per_block);
-        init(&bar[1], consumer_threads_per_block);
+        init(&bar[0], consumer_threads_per_block + producer_threads_per_block);
+        init(&bar[1], consumer_threads_per_block + producer_threads_per_block);
 
         // tracks if a buffer is ready to be consumed
-        init(&bar[2], producer_threads_per_block);
-        init(&bar[3], producer_threads_per_block);
+        init(&bar[2], producer_threads_per_block + producer_threads_per_block);
+        init(&bar[3], producer_threads_per_block + producer_threads_per_block);
     }
 
     block.sync();
@@ -225,7 +232,9 @@ __global__ void producer_consumer_pattern(
             B_buffer,
             mat_C,
             thread_linear_idx,
-            C_stride
+            C_stride,
+            M,
+            N
         );
     }
 }
@@ -465,6 +474,143 @@ void test_regular_shared_mem() {
     delete []host_C_2;
 }
 
+void test_double_buffer() {
+    // const auto data{new float[10 * 8]};
+    //
+    // print_matrix(data, 10, 8, 8);
+
+    auto host_A{new float[211 * 35]};
+    auto host_B{new float[35 * 68]};
+    auto host_C{new float[211 * 68]};
+    auto host_C_2{new float[211 * 68]};
+
+    float * dev_A;
+    float * dev_B;
+    float * dev_C;
+
+    fill_matrix_w(host_A, 211, 35, 35, -100, 100);
+    fill_matrix_w(host_B, 35, 68, 68, -100, 100);
+    fill_matrix_w(host_C, 211, 68, 68, 0, 0);
+
+    cudaMalloc(&dev_A, 211 * 35 * sizeof(float));
+    cudaMalloc(&dev_B, 35 * 68 * sizeof(float));
+    cudaMalloc(&dev_C, 211 * 68 * sizeof(float));
+
+    cudaMemcpy(dev_A, host_A, 211 * 35 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_B, host_B, 35 * 68 * sizeof(float), cudaMemcpyHostToDevice);
+
+    cpu_matmul_naive(
+        host_A,
+        host_B,
+        host_C,
+        211,
+        68,
+        35,
+        35,
+        68,
+        68
+    );
+
+    constexpr size_t TILE_SIZE_X{16};
+    constexpr size_t TILE_SIZE_Y{16};
+    constexpr size_t TILE_SIZE_K{16};
+    constexpr size_t CONSUMER_WARPS{16 * 16 / 32};
+    constexpr size_t PRODUCER_WARPS{16 * 16 / 32};
+
+    constexpr size_t THREADS_PER_BLOCK{TILE_SIZE_X * TILE_SIZE_Y};
+
+    static_assert(TILE_SIZE_K * TILE_SIZE_X % THREADS_PER_BLOCK == 0);
+    static_assert(TILE_SIZE_K * TILE_SIZE_Y % THREADS_PER_BLOCK == 0);
+
+    constexpr dim3 block_dim(PRODUCER_WARPS * 32 + CONSUMER_WARPS * 32);
+    const dim3 grid_dim(ceil_div(68, TILE_SIZE_X), ceil_div(211, TILE_SIZE_Y));
+
+    producer_consumer_pattern<
+        CONSUMER_WARPS,
+        PRODUCER_WARPS,
+        32,
+        TILE_SIZE_X,
+        TILE_SIZE_Y,
+        TILE_SIZE_K><<<grid_dim, block_dim>>>(
+            dev_A,
+            dev_B,
+            dev_C,
+            211,
+            68,
+            35,
+            35,
+            68,
+            68
+        );
+
+    cudaDeviceSynchronize();
+
+    // Check for errors in kernel execution
+    if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess)
+        std::cerr << "CUDA error: " << cudaGetErrorString(error) << std::endl;
+
+    cudaMemcpy(host_C_2, dev_C, 211 * 68 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    test_equivalency(host_C, host_C_2, 211, 68, 68);
+
+    cudaFree(dev_A);
+    cudaFree(dev_B);
+    cudaFree(dev_C);
+
+    delete []host_A;
+    delete []host_B;
+    delete []host_C;
+    delete []host_C_2;
+}
+
+void time_shared_memory() {
+    auto host_A{new float[211 * 35]};
+    auto host_B{new float[35 * 68]};
+    auto host_C{new float[211 * 68]};
+
+    float * dev_A;
+    float * dev_B;
+    float * dev_C;
+
+    fill_matrix(host_A, 4096, 4096, 4096, -100.f, 100.f);
+    fill_matrix(host_B, 4096, 4096, 4096, -100.f, 100.f);
+
+    cudaMalloc(&dev_A, 4096 * 4096 * sizeof(float));
+    cudaMalloc(&dev_B, 4096 * 4096 * sizeof(float));
+    cudaMalloc(&dev_C, 4096 * 4096 * sizeof(float));
+
+    cudaMemcpy(dev_A, host_A, 4096 * 4096 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_B, host_B, 4096 * 4096 * sizeof(float), cudaMemcpyHostToDevice);
+
+    constexpr size_t TILE_SIZE_X{16};
+    constexpr size_t TILE_SIZE_Y{16};
+    constexpr size_t TILE_SIZE_K{16};
+
+    constexpr size_t THREADS_PER_BLOCK{TILE_SIZE_X * TILE_SIZE_Y};
+
+    static_assert(TILE_SIZE_K * TILE_SIZE_X % THREADS_PER_BLOCK == 0);
+    static_assert(TILE_SIZE_K * TILE_SIZE_Y % THREADS_PER_BLOCK == 0);
+
+    constexpr dim3 block_dim(TILE_SIZE_X, TILE_SIZE_Y);
+    const dim3 grid_dim(ceil_div(68, TILE_SIZE_X), ceil_div(211, TILE_SIZE_Y));
+
+    shared_block_tile_regular<
+        TILE_SIZE_X,
+        TILE_SIZE_Y,
+        TILE_SIZE_K><<<grid_dim, block_dim>>>(
+            dev_A,
+            dev_B,
+            dev_C,
+            211,
+            68,
+            35,
+            35,
+            68,
+            68
+        );
+}
+
 void run_double_buffer_test() {
     test_regular_shared_mem();
+    test_double_buffer();
 }
