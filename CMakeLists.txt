@@ -16,7 +16,7 @@ include_directories(CUDA::toolkit)
 # Include OpenCV directories
 include_directories(${OpenCV_INCLUDE_DIRS})
 
-add_executable(learncuda main.cpp api.cu api.h buffer.cu)
+add_executable(learncuda main.cpp api.cu api.h buffer.cu ptx.cu)
 
 set_target_properties(learncuda PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)

@@ -194,12 +194,14 @@ __global__ void producer_consumer_pattern(
     // initialization
     if (block.thread_rank() == 0) {
         // tracks if a buffer is ready to be filled
-        init(&bar[0], consumer_threads_per_block + producer_threads_per_block);
-        init(&bar[1], consumer_threads_per_block + producer_threads_per_block);
+
+        // printf("%d, %lu \n", block.size(), producer_threads_per_block + consumer_threads_per_block);
+        init(&bar[0], producer_threads_per_block + consumer_threads_per_block);
+        init(&bar[1], producer_threads_per_block + consumer_threads_per_block);
 
         // tracks if a buffer is ready to be consumed
-        init(&bar[2], producer_threads_per_block + producer_threads_per_block);
-        init(&bar[3], producer_threads_per_block + producer_threads_per_block);
+        init(&bar[2], producer_threads_per_block + consumer_threads_per_block);
+        init(&bar[3], producer_threads_per_block + consumer_threads_per_block);
     }
 
     block.sync();
@@ -515,7 +517,7 @@ void test_double_buffer() {
     constexpr size_t TILE_SIZE_Y{16};
     constexpr size_t TILE_SIZE_K{16};
     constexpr size_t CONSUMER_WARPS{16 * 16 / 32};
-    constexpr size_t PRODUCER_WARPS{16 * 16 / 32};
+    constexpr size_t PRODUCER_WARPS{4};
 
     constexpr size_t THREADS_PER_BLOCK{TILE_SIZE_X * TILE_SIZE_Y};
 
@@ -564,9 +566,8 @@ void test_double_buffer() {
 }
 
 void time_shared_memory() {
-    auto host_A{new float[211 * 35]};
-    auto host_B{new float[35 * 68]};
-    auto host_C{new float[211 * 68]};
+    auto host_A{new float[4096 * 4096]};
+    auto host_B{new float[4096 * 4096]};
 
     float * dev_A;
     float * dev_B;
@@ -592,8 +593,13 @@ void time_shared_memory() {
     static_assert(TILE_SIZE_K * TILE_SIZE_Y % THREADS_PER_BLOCK == 0);
 
     constexpr dim3 block_dim(TILE_SIZE_X, TILE_SIZE_Y);
-    const dim3 grid_dim(ceil_div(68, TILE_SIZE_X), ceil_div(211, TILE_SIZE_Y));
+    const dim3 grid_dim(ceil_div(4096, TILE_SIZE_X), ceil_div(4096, TILE_SIZE_Y));
 
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
     shared_block_tile_regular<
         TILE_SIZE_X,
         TILE_SIZE_Y,
@@ -601,16 +607,109 @@ void time_shared_memory() {
             dev_A,
             dev_B,
             dev_C,
-            211,
-            68,
-            35,
-            35,
-            68,
-            68
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096
         );
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    std::cout << milliseconds << "\n";
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    cudaFree(dev_A);
+    cudaFree(dev_B);
+    cudaFree(dev_C);
+
+    delete []host_A;
+    delete []host_B;
 }
+
+void time_double_buffer() {
+    auto host_A{new float[4096 * 4096]};
+    auto host_B{new float[4096 * 4096]};
+
+    float * dev_A;
+    float * dev_B;
+    float * dev_C;
+
+    fill_matrix(host_A, 4096, 4096, 4096, -100.f, 100.f);
+    fill_matrix(host_B, 4096, 4096, 4096, -100.f, 100.f);
+
+    cudaMalloc(&dev_A, 4096 * 4096 * sizeof(float));
+    cudaMalloc(&dev_B, 4096 * 4096 * sizeof(float));
+    cudaMalloc(&dev_C, 4096 * 4096 * sizeof(float));
+
+    cudaMemcpy(dev_A, host_A, 4096 * 4096 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_B, host_B, 4096 * 4096 * sizeof(float), cudaMemcpyHostToDevice);
+
+    constexpr size_t TILE_SIZE_X{16};
+    constexpr size_t TILE_SIZE_Y{16};
+    constexpr size_t TILE_SIZE_K{16};
+    constexpr size_t CONSUMER_WARPS{16 * 16 / 32};
+    constexpr size_t PRODUCER_WARPS{16 * 16 / 32};
+
+    constexpr size_t THREADS_PER_BLOCK{TILE_SIZE_X * TILE_SIZE_Y};
+
+    static_assert(TILE_SIZE_K * TILE_SIZE_X % THREADS_PER_BLOCK == 0);
+    static_assert(TILE_SIZE_K * TILE_SIZE_Y % THREADS_PER_BLOCK == 0);
+
+    constexpr dim3 block_dim(PRODUCER_WARPS * 32 + CONSUMER_WARPS * 32);
+    const dim3 grid_dim(ceil_div(4096, TILE_SIZE_X), ceil_div(4096, TILE_SIZE_Y));
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    producer_consumer_pattern<
+        CONSUMER_WARPS,
+        PRODUCER_WARPS,
+        32,
+        TILE_SIZE_X,
+        TILE_SIZE_Y,
+        TILE_SIZE_K><<<grid_dim, block_dim>>>(
+            dev_A,
+            dev_B,
+            dev_C,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096
+        );
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    std::cout << milliseconds;
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    cudaFree(dev_A);
+    cudaFree(dev_B);
+    cudaFree(dev_C);
+
+    delete []host_A;
+    delete []host_B;
+}
+
 
 void run_double_buffer_test() {
     test_regular_shared_mem();
     test_double_buffer();
+    time_shared_memory();
+    time_double_buffer();
 }

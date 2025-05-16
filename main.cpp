@@ -9,7 +9,9 @@
 
 int main() {
 
-    run_double_buffer_test();
+    // run_double_buffer_test();
+
+    test_global_load();
 
     // int dev_count;
     // cudaGetDeviceCount( &dev_count);

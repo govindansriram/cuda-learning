@@ -61,6 +61,7 @@ void matmul(const float * mat1, const float * mat2, float * dest_mat, size_t mat
 void tiled_matmul(const float * mat1, const float * mat2, float * dest_mat, size_t mat1_rows, size_t shared_dim, size_t mat2_columns);
 void get_device_settings();
 void run_double_buffer_test();
+void test_global_load();
 
 
 #endif //API_H
