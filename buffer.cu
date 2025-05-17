@@ -268,7 +268,7 @@ __device__ __forceinline__ void accumulate(
     const auto B_load_ptr{reinterpret_cast<float *>(B_block_load_addr)};
 
     for (size_t k{0}; k < TILE_SIZE_K; ++k)
-        partial += A_load_ptr[threadIdx.y * TILE_SIZE_X + k] * B_load_ptr[k * TILE_SIZE_X + threadIdx.x];
+        partial += A_load_ptr[threadIdx.y * TILE_SIZE_K + k] * B_load_ptr[k * TILE_SIZE_X + threadIdx.x];
 
 }
 
@@ -348,7 +348,7 @@ __global__ void gemm_double_buffering(
             A_buffer_size,
             B_buffer_size,
             THREADS_PER_BLOCK>(
-            0,
+            iter + 1,
             A_store_ptr,
             B_store_ptr,
             mat_A,
@@ -609,6 +609,91 @@ void print_matrix(
         }
         std::cout << "]\n";
     }
+}
+
+void test_double_buffer_gemm() {
+    // const auto data{new float[10 * 8]};
+    //
+    // print_matrix(data, 10, 8, 8);
+
+    auto host_A{new float[211 * 35]};
+    auto host_B{new float[35 * 68]};
+    auto host_C{new float[211 * 68]};
+    auto host_C_2{new float[211 * 68]};
+
+    float *dev_A;
+    float *dev_B;
+    float *dev_C;
+
+    fill_matrix_w(host_A, 211, 35, 35, -100, 100);
+    fill_matrix_w(host_B, 35, 68, 68, -100, 100);
+    fill_matrix_w(host_C, 211, 68, 68, 0, 0);
+
+    cudaMalloc(&dev_A, 211 * 35 * sizeof(float));
+    cudaMalloc(&dev_B, 35 * 68 * sizeof(float));
+    cudaMalloc(&dev_C, 211 * 68 * sizeof(float));
+
+    cudaMemcpy(dev_A, host_A, 211 * 35 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_B, host_B, 35 * 68 * sizeof(float), cudaMemcpyHostToDevice);
+
+    cpu_matmul_naive(
+        host_A,
+        host_B,
+        host_C,
+        211,
+        68,
+        35,
+        35,
+        68,
+        68
+    );
+
+    constexpr size_t TILE_SIZE_X{16};
+    constexpr size_t TILE_SIZE_Y{16};
+    constexpr size_t TILE_SIZE_K{16};
+
+    constexpr size_t THREADS_PER_BLOCK{TILE_SIZE_X * TILE_SIZE_Y};
+
+    static_assert(TILE_SIZE_K * TILE_SIZE_X % THREADS_PER_BLOCK == 0);
+    static_assert(TILE_SIZE_K * TILE_SIZE_Y % THREADS_PER_BLOCK == 0);
+
+    constexpr dim3 block_dim(TILE_SIZE_X, TILE_SIZE_Y);
+    const dim3 grid_dim(ceil_div(68, TILE_SIZE_X), ceil_div(211, TILE_SIZE_Y));
+
+    gemm_double_buffering<
+        THREADS_PER_BLOCK,
+        TILE_SIZE_X,
+        TILE_SIZE_Y,
+        TILE_SIZE_K><<<grid_dim, block_dim>>>(
+        dev_A,
+        dev_B,
+        dev_C,
+        211,
+        68,
+        35,
+        35,
+        68,
+        68
+    );
+
+    cudaDeviceSynchronize();
+
+    // Check for errors in kernel execution
+    if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess)
+        std::cerr << "CUDA error: " << cudaGetErrorString(error) << std::endl;
+
+    cudaMemcpy(host_C_2, dev_C, 211 * 68 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    test_equivalency(host_C, host_C_2, 211, 68, 68);
+
+    cudaFree(dev_A);
+    cudaFree(dev_B);
+    cudaFree(dev_C);
+
+    delete []host_A;
+    delete []host_B;
+    delete []host_C;
+    delete []host_C_2;
 }
 
 void test_regular_shared_mem() {
@@ -927,8 +1012,8 @@ void time_double_buffer() {
 
 
 void run_double_buffer_test() {
-    test_regular_shared_mem();
-    test_double_buffer();
-    time_shared_memory();
-    time_double_buffer();
+    // test_regular_shared_mem();
+    test_double_buffer_gemm();
+    // time_shared_memory();
+    // time_double_buffer();
 }
