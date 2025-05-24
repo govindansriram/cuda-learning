@@ -5,12 +5,256 @@
 #include "api.h"
 #include <cooperative_groups.h>
 #include <cuda/barrier>
+#include <cuda/pipeline>
 #include <random>
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 
 __device__ __host__ __forceinline__ size_t ceil_div(const size_t top, const size_t bottom) {
     return (top + (bottom - 1)) / bottom;
+}
+
+
+template<
+    typename T,
+    typename VECTOR_TYPE = int4,
+    size_t BLOCK_TILE_SIZE_X,
+    size_t BLOCK_TILE_SIZE_Y,
+    size_t BLOCK_TILE_SIZE_K,
+    size_t THREADS_PER_BLOCK,
+    size_t BLOCK_TILE_SKEW_SIZE_X = 0,
+    size_t BLOCK_TILE_SKEW_SIZE_Y = 0
+>
+__device__ void load_data_to_shared_memory_transposed_vectorized(
+    const T *matrix_one,
+    const T *matrix_two,
+    const size_t stride_one,
+    const size_t stride_two,
+    T one_shared[BLOCK_TILE_SIZE_K][BLOCK_TILE_SIZE_Y + BLOCK_TILE_SKEW_SIZE_Y],
+    T two_shared[BLOCK_TILE_SIZE_K][BLOCK_TILE_SIZE_X + BLOCK_TILE_SKEW_SIZE_X],
+    const size_t mat_one_rows,
+    const size_t mat_two_columns,
+    const size_t shared,
+    const uint iteration,
+    const uint thread_linear_idx,
+    VECTOR_TYPE v0
+) {
+    constexpr size_t units_per_vector{sizeof(VECTOR_TYPE) / sizeof(T)};
+    static_assert(sizeof(VECTOR_TYPE) % sizeof(T) == 0);
+
+    // ensure there will be an even amount of vectorized loads
+    static_assert(BLOCK_TILE_SIZE_X % units_per_vector == 0);
+    static_assert(BLOCK_TILE_SIZE_K % units_per_vector == 0);
+
+#ifndef BENCHMARK
+    // ensures leading dimensions are padded to handle additional reads
+    assert(stride_one % units_per_vector == 0);
+    assert(stride_two % units_per_vector == 0);
+#endif
+
+    // We need to make sure the data alignment is correct.
+    static_assert((BLOCK_TILE_SIZE_Y) * sizeof(T) % sizeof(VECTOR_TYPE) == 0U);
+    static_assert((BLOCK_TILE_SIZE_X) * sizeof(T) % sizeof(VECTOR_TYPE) == 0U);
+
+    static_assert((BLOCK_TILE_SIZE_Y + BLOCK_TILE_SKEW_SIZE_Y) * sizeof(T) % sizeof(VECTOR_TYPE) == 0U);
+    static_assert((BLOCK_TILE_SIZE_X + BLOCK_TILE_SKEW_SIZE_X) * sizeof(T) % sizeof(VECTOR_TYPE) == 0U);
+
+    // scaling the load number down to account for the vectorized size
+    constexpr size_t VEC_BLOCK_TILE_SIZE_X{BLOCK_TILE_SIZE_X / units_per_vector};
+    constexpr size_t VEC_BLOCK_TILE_SIZE_K{BLOCK_TILE_SIZE_K / units_per_vector};
+
+    // determines how many vectorized loads are performed per thread
+    constexpr size_t one_iterations{
+        ceil_div(BLOCK_TILE_SIZE_Y * VEC_BLOCK_TILE_SIZE_K, THREADS_PER_BLOCK)
+    };
+
+    // load into matrix one
+#pragma unroll
+    for (size_t one_iter{0}; one_iter < one_iterations; ++one_iter) {
+        const size_t one_shared_row{(thread_linear_idx + one_iter * THREADS_PER_BLOCK) / VEC_BLOCK_TILE_SIZE_K};
+        const size_t one_shared_column{
+            (thread_linear_idx + one_iter * THREADS_PER_BLOCK) % VEC_BLOCK_TILE_SIZE_K * units_per_vector
+        };
+
+        const size_t mat_one_row{blockIdx.y * BLOCK_TILE_SIZE_Y + one_shared_row};
+        const size_t mat_one_column{iteration * BLOCK_TILE_SIZE_K + one_shared_column};
+
+        VECTOR_TYPE mat_one_row_vector_vals{v0};
+
+        // if in bounds we save the data to the temp register value mat_one_row_vector_vals
+        if (mat_one_row < mat_one_rows && mat_one_column < shared) {
+            const VECTOR_TYPE *mat_one_vec_ptr{
+                reinterpret_cast<const VECTOR_TYPE *>(matrix_one + (mat_one_row * stride_one) + mat_one_column)
+            };
+            mat_one_row_vector_vals = *mat_one_vec_ptr;
+        }
+
+        // Transposed store of the data back into shared memory
+        if (one_shared_row < BLOCK_TILE_SIZE_Y && one_shared_column < BLOCK_TILE_SIZE_K) {
+            for (size_t i{0}; i < units_per_vector; ++i) {
+                one_shared[one_shared_column + i][one_shared_row] =
+                        reinterpret_cast<const T *>(&mat_one_row_vector_vals)[i];
+            }
+        }
+    }
+
+    constexpr size_t two_iterations{ceil_div(BLOCK_TILE_SIZE_K * VEC_BLOCK_TILE_SIZE_X, THREADS_PER_BLOCK)};
+
+    // load into matrix two
+#pragma unroll
+    for (size_t two_iter{0}; two_iter < two_iterations; ++two_iter) {
+        const size_t two_shared_row{(thread_linear_idx + two_iter * THREADS_PER_BLOCK) / VEC_BLOCK_TILE_SIZE_X};
+
+        const size_t two_shared_column{
+            (thread_linear_idx + two_iter * THREADS_PER_BLOCK) % VEC_BLOCK_TILE_SIZE_X * units_per_vector
+        };
+
+        const size_t mat_two_row{iteration * BLOCK_TILE_SIZE_K + two_shared_row};
+        const size_t mat_two_column{blockIdx.x * BLOCK_TILE_SIZE_X + two_shared_column};
+
+        VECTOR_TYPE mat_two_row_vector_vals{v0};
+
+        // if in bounds we save the data to the temp register value mat_two_row_vector_vals
+        if (mat_two_row < shared && mat_two_column < mat_two_columns) {
+            const VECTOR_TYPE *mat_two_vec_ptr{
+                reinterpret_cast<const VECTOR_TYPE *>(matrix_two + (mat_two_row * stride_two) + mat_two_column)
+            };
+
+            mat_two_row_vector_vals = *mat_two_vec_ptr;
+        }
+
+        if (two_shared_row < BLOCK_TILE_SIZE_K && two_shared_column < BLOCK_TILE_SIZE_X) {
+            *reinterpret_cast<VECTOR_TYPE *>(&two_shared[two_shared_row][two_shared_column]) =
+                    mat_two_row_vector_vals;
+        }
+    }
+}
+
+// TODO see if vectorized copies are better (16 bytes at at time)
+// only possible for B matrices
+template<
+    typename T,
+    size_t BLOCK_TILE_SIZE_X,
+    size_t BLOCK_TILE_SIZE_K,
+    size_t THREADS_PER_BLOCK,
+    size_t BLOCK_TILE_SKEW_X = 0
+>
+__device__ __forceinline__ void load_data_to_shared_matrix_B_async(
+    T B_shared[BLOCK_TILE_SIZE_K][BLOCK_TILE_SIZE_X + BLOCK_TILE_SKEW_X],
+    const T *B_matrix,
+    const size_t k,
+    const size_t n,
+    const size_t leading_dimension,
+    const uint iteration,
+    const uint thread_linear_idx,
+    cuda::pipeline<cuda::thread_scope_thread> &B_shared_pipeline
+) {
+    // ensures even amount of copies per thread
+    static_assert(BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_X % THREADS_PER_BLOCK == 0);
+
+    // determines how many copies are performed per thread
+    constexpr size_t copy_iterations{
+        ceil_div(BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_X, THREADS_PER_BLOCK)
+    };
+
+#pragma unroll
+    for (size_t copy_iter{0}; copy_iter < copy_iterations; ++copy_iter) {
+        const size_t shared_row{
+            (thread_linear_idx + copy_iter * THREADS_PER_BLOCK) / BLOCK_TILE_SIZE_X
+        };
+
+        const size_t shared_column{
+            (thread_linear_idx + copy_iter * THREADS_PER_BLOCK) % BLOCK_TILE_SIZE_X
+        };
+
+        const size_t B_row{iteration * BLOCK_TILE_SIZE_K + shared_row};
+        const size_t B_column{blockIdx.x * BLOCK_TILE_SIZE_X + shared_column};
+
+        T value{static_cast<T>(0)};
+        T *p_value{&value};
+
+        if (B_row < k && B_column < n)
+            p_value = B_matrix + (leading_dimension * B_row + B_column);
+
+        B_shared_pipeline.producer_acquire();
+
+        cuda::memcpy_async(
+            &B_shared[shared_row][shared_column],
+            p_value,
+            sizeof(T),
+            B_shared_pipeline
+        );
+
+        B_shared_pipeline.producer_commit();
+    }
+}
+
+template<
+    typename T,
+    size_t BLOCK_TILE_SIZE_Y,
+    size_t BLOCK_TILE_SIZE_K,
+    size_t THREADS_PER_BLOCK,
+    size_t BLOCK_TILE_SKEW_Y = 0
+>
+__device__ __forceinline__ void load_data_to_shared_matrix_A_transposed_async(
+    T A_shared_T[BLOCK_TILE_SIZE_K][BLOCK_TILE_SIZE_Y + BLOCK_TILE_SKEW_Y],
+    const T *A_matrix,
+    const size_t k,
+    const size_t m,
+    const size_t leading_dimension,
+    const uint iteration,
+    const uint thread_linear_idx,
+    cuda::pipeline<cuda::thread_scope_thread> &A_shared_pipeline
+) {
+    // ensures even amount of copies per thread
+    static_assert(BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_Y % THREADS_PER_BLOCK == 0);
+
+    // determines how many copies are performed per thread
+    constexpr size_t copy_iterations{
+        ceil_div(BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_Y, THREADS_PER_BLOCK)
+    };
+
+#pragma unroll
+    for (size_t copy_iter{0}; copy_iter < copy_iterations; ++copy_iter) {
+        const size_t shared_row{
+            (thread_linear_idx + copy_iter * THREADS_PER_BLOCK) / BLOCK_TILE_SIZE_K
+        };
+
+        const size_t shared_column{
+            (thread_linear_idx + copy_iter * THREADS_PER_BLOCK) % BLOCK_TILE_SIZE_K
+        };
+
+        const size_t A_row{blockIdx.y * BLOCK_TILE_SIZE_Y + shared_row};
+        const size_t A_column{iteration * BLOCK_TILE_SIZE_K + shared_column};
+
+        T value{static_cast<T>(0)};
+        T *p_value{&value};
+
+        if (A_row < m && A_column < k)
+            p_value = A_matrix + (leading_dimension * A_row + A_column);
+
+        A_shared_pipeline.producer_acquire();
+
+        cuda::memcpy_async(
+            &A_shared_T[shared_column][shared_row],
+            p_value,
+            sizeof(T),
+            A_shared_pipeline
+        );
+
+        A_shared_pipeline.producer_commit();
+    }
+}
+
+template<
+    typename T,
+    size_t BLOCK_TILE_SIZE_Y,
+    size_t BLOCK_TILE_SIZE_K,
+    size_t THREADS_PER_BLOCK,
+    size_t BLOCK_TILE_SKEW_Y = 0
+>
+__device__ __forceinline__ void load_data_to_shared_async() {
+
 }
 
 __device__ __host__ __forceinline__ constexpr bool is_power_of_two(const size_t x) {
@@ -263,13 +507,11 @@ __device__ __forceinline__ void accumulate(
     float &partial,
     const uintptr_t A_block_load_addr,
     const uintptr_t B_block_load_addr) {
-
     const auto A_load_ptr{reinterpret_cast<float *>(A_block_load_addr)};
     const auto B_load_ptr{reinterpret_cast<float *>(B_block_load_addr)};
 
     for (size_t k{0}; k < TILE_SIZE_K; ++k)
         partial += A_load_ptr[threadIdx.y * TILE_SIZE_K + k] * B_load_ptr[k * TILE_SIZE_X + threadIdx.x];
-
 }
 
 template<
@@ -869,6 +1111,24 @@ void test_double_buffer() {
     delete []host_C_2;
 }
 
+void flush_l2_cache() {
+    int dev_id{};
+    int m_l2_size{};
+    void *buffer;
+    cudaGetDevice(&dev_id);
+    cudaDeviceGetAttribute(&m_l2_size, cudaDevAttrL2CacheSize, dev_id);
+    if (m_l2_size > 0) {
+        cudaMalloc(&buffer, static_cast<std::size_t>(m_l2_size));
+        int *m_l2_buffer = reinterpret_cast<int *>(buffer);
+        cudaMemsetAsync(m_l2_buffer, 0, static_cast<std::size_t>(m_l2_size));
+        cudaFree(m_l2_buffer);
+    }
+
+    // Check for errors in kernel execution
+    if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess)
+        std::cerr << "CUDA error: " << cudaGetErrorString(error) << std::endl;
+}
+
 void time_shared_memory() {
     auto host_A{new float[4096 * 4096]};
     auto host_B{new float[4096 * 4096]};
@@ -903,28 +1163,111 @@ void time_shared_memory() {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    cudaEventRecord(start);
-    shared_block_tile_regular<
-        TILE_SIZE_X,
-        TILE_SIZE_Y,
-        TILE_SIZE_K><<<grid_dim, block_dim>>>(
-        dev_A,
-        dev_B,
-        dev_C,
-        4096,
-        4096,
-        4096,
-        4096,
-        4096,
-        4096
-    );
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    float total{0};
 
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
+    for (int i{0}; i < 371; ++i) {
+        float milliseconds = 0;
+        cudaEventRecord(start);
+        shared_block_tile_regular<
+            TILE_SIZE_X,
+            TILE_SIZE_Y,
+            TILE_SIZE_K><<<grid_dim, block_dim>>>(
+            dev_A,
+            dev_B,
+            dev_C,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096
+        );
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&milliseconds, start, stop);
 
-    std::cout << milliseconds << "\n";
+        if (i > 185) total += milliseconds;
+        flush_l2_cache();
+    }
+
+    std::cout << total / 185 << "\n";
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    cudaFree(dev_A);
+    cudaFree(dev_B);
+    cudaFree(dev_C);
+
+    delete []host_A;
+    delete []host_B;
+
+    flush_l2_cache();
+}
+
+void time_db_gemm_memory() {
+    auto host_A{new float[4096 * 4096]};
+    auto host_B{new float[4096 * 4096]};
+
+    float *dev_A;
+    float *dev_B;
+    float *dev_C;
+
+    fill_matrix(host_A, 4096, 4096, 4096, -100.f, 100.f);
+    fill_matrix(host_B, 4096, 4096, 4096, -100.f, 100.f);
+
+    cudaMalloc(&dev_A, 4096 * 4096 * sizeof(float));
+    cudaMalloc(&dev_B, 4096 * 4096 * sizeof(float));
+    cudaMalloc(&dev_C, 4096 * 4096 * sizeof(float));
+
+    cudaMemcpy(dev_A, host_A, 4096 * 4096 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_B, host_B, 4096 * 4096 * sizeof(float), cudaMemcpyHostToDevice);
+
+    constexpr size_t TILE_SIZE_X{32};
+    constexpr size_t TILE_SIZE_Y{32};
+    constexpr size_t TILE_SIZE_K{32};
+
+    constexpr size_t THREADS_PER_BLOCK{TILE_SIZE_X * TILE_SIZE_Y};
+
+    static_assert(TILE_SIZE_K * TILE_SIZE_X % THREADS_PER_BLOCK == 0);
+    static_assert(TILE_SIZE_K * TILE_SIZE_Y % THREADS_PER_BLOCK == 0);
+
+    constexpr dim3 block_dim(TILE_SIZE_X, TILE_SIZE_Y);
+    const dim3 grid_dim(ceil_div(4096, TILE_SIZE_X), ceil_div(4096, TILE_SIZE_Y));
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    float total{0};
+
+    for (int i{0}; i < 371; ++i) {
+        float milliseconds = 0;
+        cudaEventRecord(start);
+        gemm_double_buffering<
+            THREADS_PER_BLOCK,
+            TILE_SIZE_X,
+            TILE_SIZE_Y,
+            TILE_SIZE_K><<<grid_dim, block_dim>>>(
+            dev_A,
+            dev_B,
+            dev_C,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096
+        );
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&milliseconds, start, stop);
+
+        if (i > 185) total += milliseconds;
+        flush_l2_cache();
+    }
+
+    std::cout << total / 185 << "\n";
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -1013,7 +1356,8 @@ void time_double_buffer() {
 
 void run_double_buffer_test() {
     // test_regular_shared_mem();
-    test_double_buffer_gemm();
-    // time_shared_memory();
+    // test_double_buffer_gemm();
+    time_db_gemm_memory();
+    time_shared_memory();
     // time_double_buffer();
 }
