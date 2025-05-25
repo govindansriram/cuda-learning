@@ -10,7 +10,7 @@
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 
-__device__ __host__ __forceinline__ size_t ceil_div(const size_t top, const size_t bottom) {
+__device__ __host__ __forceinline__ constexpr size_t ceil_div(const size_t top, const size_t bottom) {
     return (top + (bottom - 1)) / bottom;
 }
 
@@ -263,7 +263,7 @@ template<
     size_t BLOCK_TILE_SKEW_X = 0,
     size_t BLOCK_TILE_SKEW_Y = 0
 >
-__device__ __forceinline__ void load_data_to_shared_async(
+__device__ void load_data_to_shared_async(
     T A_shared_T[BLOCK_TILE_SIZE_K][BLOCK_TILE_SIZE_Y + BLOCK_TILE_SKEW_Y],
     T B_shared[BLOCK_TILE_SIZE_K][BLOCK_TILE_SIZE_X + BLOCK_TILE_SKEW_X],
     const T *A_matrix,
@@ -760,7 +760,7 @@ __global__ void gemm_2DBT_2DWT_2DTT_async_load(
         __syncthreads();
 
         // #pragma unroll
-        for (size_t k{0}; k < BLOCK_TILE_SIZE_K; ++k) {
+        for (size_t kk{0}; kk < BLOCK_TILE_SIZE_K; ++kk) {
             // we need to start filling the one matrix cache
 #pragma unroll
             for (size_t y_cache_idx{0}; y_cache_idx < NUM_CACHES_PER_WARP_Y; ++y_cache_idx) {
@@ -866,7 +866,7 @@ __global__ void gemm_2DBT_2DWT_2DTT_async_load(
                 n,
                 leading_dim_A,
                 leading_dim_B,
-                0,
+                iter,
                 thread_linear_idx,
                 A_shared_pipeline,
                 B_shared_pipeline
@@ -1684,6 +1684,118 @@ void test_regular_shared_mem() {
     delete []host_C_2;
 }
 
+void test_gemm_2DBT_2DWT_2DTT_vload() {
+
+    auto host_A{new float[211 * 32]};
+    auto host_B{new float[32 * 64]};
+    auto host_C{new float[211 * 64]};
+    auto host_C_2{new float[211 * 64]};
+
+    float *dev_A;
+    float *dev_B;
+    float *dev_C;
+
+    fill_matrix_w(host_A, 211, 32, 32, -100, 100);
+    fill_matrix_w(host_B, 32, 64, 64, -100, 100);
+    fill_matrix_w(host_C, 211, 64, 64, 0, 0);
+
+    cudaMalloc(&dev_A, 211 * 32 * sizeof(float));
+    cudaMalloc(&dev_B, 32 * 64 * sizeof(float));
+    cudaMalloc(&dev_C, 211 * 64 * sizeof(float));
+
+    cudaMemcpy(dev_A, host_A, 211 * 32 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_B, host_B, 32 * 64 * sizeof(float), cudaMemcpyHostToDevice);
+
+    cpu_matmul_naive(
+        host_A,
+        host_B,
+        host_C,
+        211,
+        64,
+        32,
+        32,
+        64,
+        64
+    );
+
+    constexpr uint BLOCK_TILE_SIZE_X{128};
+    constexpr uint BLOCK_TILE_SIZE_Y{128};
+    constexpr uint BLOCK_TILE_SIZE_K{16};
+
+    constexpr unsigned int WARP_TILE_SIZE_X{64};
+    constexpr unsigned int WARP_TILE_SIZE_Y{64};
+
+    constexpr size_t NUM_WARPS_PER_BLOCK_X{BLOCK_TILE_SIZE_X / WARP_TILE_SIZE_X};
+    constexpr size_t NUM_WARPS_PER_BLOCK_Y{BLOCK_TILE_SIZE_Y / WARP_TILE_SIZE_Y};
+
+    static_assert(BLOCK_TILE_SIZE_X % WARP_TILE_SIZE_X == 0);
+    static_assert(BLOCK_TILE_SIZE_Y % WARP_TILE_SIZE_Y == 0);
+
+    // The size of the internal register caches
+    constexpr uint THREAD_TILE_SIZE_Y{8};
+    constexpr uint THREAD_TILE_SIZE_X{8};
+
+    constexpr unsigned int NUM_THREADS_PER_WARP_X{4};
+    constexpr unsigned int NUM_THREADS_PER_WARP_Y{8};
+
+    static_assert(NUM_THREADS_PER_WARP_X * NUM_THREADS_PER_WARP_Y == 32);
+
+    // ensure each thread stores the same amount of data in their tiles
+    static_assert(WARP_TILE_SIZE_X % (THREAD_TILE_SIZE_X * NUM_THREADS_PER_WARP_X) == 0);
+    static_assert(WARP_TILE_SIZE_Y % (THREAD_TILE_SIZE_Y * NUM_THREADS_PER_WARP_Y) == 0);
+
+    const dim3 grid_dim{
+        ceil_div(64, BLOCK_TILE_SIZE_X),
+        ceil_div(211, BLOCK_TILE_SIZE_Y)
+    };
+
+    constexpr size_t NUM_THREADS_PER_BLOCK{32 * NUM_WARPS_PER_BLOCK_X * NUM_WARPS_PER_BLOCK_Y};
+    constexpr dim3 block_dim(NUM_THREADS_PER_BLOCK);
+
+    gemm_2DBT_2DWT_2DTT_vload<
+        float,
+        BLOCK_TILE_SIZE_X,
+        BLOCK_TILE_SIZE_Y,
+        BLOCK_TILE_SIZE_K,
+        WARP_TILE_SIZE_X,
+        WARP_TILE_SIZE_Y,
+        THREAD_TILE_SIZE_X,
+        THREAD_TILE_SIZE_Y,
+        NUM_THREADS_PER_WARP_X,
+        NUM_THREADS_PER_WARP_Y><<<grid_dim, block_dim>>>(
+        dev_A,
+        dev_B,
+        dev_C,
+        1,
+        1,
+        211,
+        64,
+        32,
+        32,
+        64,
+        64
+    );
+
+    cudaDeviceSynchronize();
+
+    // Check for errors in kernel execution
+    if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess)
+        std::cerr << "CUDA error: " << cudaGetErrorString(error) << std::endl;
+
+    cudaMemcpy(host_C_2, dev_C, 211 * 64 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    test_equivalency(host_C, host_C_2, 211, 64, 64);
+
+    cudaFree(dev_A);
+    cudaFree(dev_B);
+    cudaFree(dev_C);
+
+    delete []host_A;
+    delete []host_B;
+    delete []host_C;
+    delete []host_C_2;
+}
+
 void test_double_buffer() {
     // const auto data{new float[10 * 8]};
     //
@@ -1867,6 +1979,115 @@ void time_shared_memory() {
     flush_l2_cache();
 }
 
+void time_gemm_2DBT_2DWT_2DTT_vload() {
+    auto host_A{new float[4096 * 4096]};
+    auto host_B{new float[4096 * 4096]};
+
+    float *dev_A;
+    float *dev_B;
+    float *dev_C;
+
+    fill_matrix(host_A, 4096, 4096, 4096, -100.f, 100.f);
+    fill_matrix(host_B, 4096, 4096, 4096, -100.f, 100.f);
+
+    cudaMalloc(&dev_A, 4096 * 4096 * sizeof(float));
+    cudaMalloc(&dev_B, 4096 * 4096 * sizeof(float));
+    cudaMalloc(&dev_C, 4096 * 4096 * sizeof(float));
+
+    cudaMemcpy(dev_A, host_A, 4096 * 4096 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_B, host_B, 4096 * 4096 * sizeof(float), cudaMemcpyHostToDevice);
+
+    constexpr uint BLOCK_TILE_SIZE_X{128};
+    constexpr uint BLOCK_TILE_SIZE_Y{128};
+    constexpr uint BLOCK_TILE_SIZE_K{16};
+
+    constexpr unsigned int WARP_TILE_SIZE_X{64};
+    constexpr unsigned int WARP_TILE_SIZE_Y{64};
+
+    constexpr size_t NUM_WARPS_PER_BLOCK_X{BLOCK_TILE_SIZE_X / WARP_TILE_SIZE_X};
+    constexpr size_t NUM_WARPS_PER_BLOCK_Y{BLOCK_TILE_SIZE_Y / WARP_TILE_SIZE_Y};
+
+    static_assert(BLOCK_TILE_SIZE_X % WARP_TILE_SIZE_X == 0);
+    static_assert(BLOCK_TILE_SIZE_Y % WARP_TILE_SIZE_Y == 0);
+
+    // The size of the internal register caches
+    constexpr uint THREAD_TILE_SIZE_Y{8};
+    constexpr uint THREAD_TILE_SIZE_X{8};
+
+    constexpr unsigned int NUM_THREADS_PER_WARP_X{4};
+    constexpr unsigned int NUM_THREADS_PER_WARP_Y{8};
+
+    static_assert(NUM_THREADS_PER_WARP_X * NUM_THREADS_PER_WARP_Y == 32);
+
+    // ensure each thread stores the same amount of data in their tiles
+    static_assert(WARP_TILE_SIZE_X % (THREAD_TILE_SIZE_X * NUM_THREADS_PER_WARP_X) == 0);
+    static_assert(WARP_TILE_SIZE_Y % (THREAD_TILE_SIZE_Y * NUM_THREADS_PER_WARP_Y) == 0);
+
+    const dim3 grid_dim{
+        ceil_div(4096, BLOCK_TILE_SIZE_X),
+        ceil_div(4096, BLOCK_TILE_SIZE_Y)
+    };
+
+    constexpr size_t NUM_THREADS_PER_BLOCK{32 * NUM_WARPS_PER_BLOCK_X * NUM_WARPS_PER_BLOCK_Y};
+    constexpr dim3 block_dim(NUM_THREADS_PER_BLOCK);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    float total{0};
+
+    for (int i{0}; i < 371; ++i) {
+        float milliseconds = 0;
+        cudaEventRecord(start);
+
+        gemm_2DBT_2DWT_2DTT_vload<
+            float,
+            BLOCK_TILE_SIZE_X,
+            BLOCK_TILE_SIZE_Y,
+            BLOCK_TILE_SIZE_K,
+            WARP_TILE_SIZE_X,
+            WARP_TILE_SIZE_Y,
+            THREAD_TILE_SIZE_X,
+            THREAD_TILE_SIZE_Y,
+            NUM_THREADS_PER_WARP_X,
+            NUM_THREADS_PER_WARP_Y><<<grid_dim, block_dim>>>(
+            dev_A,
+            dev_B,
+            dev_C,
+            1,
+            1,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096
+        );
+
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&milliseconds, start, stop);
+
+        if (i > 185) total += milliseconds;
+        flush_l2_cache();
+    }
+
+    std::cout << total / 185 << "\n";
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    cudaFree(dev_A);
+    cudaFree(dev_B);
+    cudaFree(dev_C);
+
+    delete []host_A;
+    delete []host_B;
+
+    flush_l2_cache();
+}
+
 void time_db_gemm_memory() {
     auto host_A{new float[4096 * 4096]};
     auto host_B{new float[4096 * 4096]};
@@ -2019,7 +2240,9 @@ void time_double_buffer() {
 void run_double_buffer_test() {
     // test_regular_shared_mem();
     // test_double_buffer_gemm();
-    time_db_gemm_memory();
+    // time_db_gemm_memory();
     time_shared_memory();
+    time_gemm_2DBT_2DWT_2DTT_vload();
+    // test_gemm_2DBT_2DWT_2DTT_vload();
     // time_double_buffer();
 }
