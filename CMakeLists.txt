@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 
 set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
-set(CMAKE_CUDA_ARCHITECTURES 89)
+set(CMAKE_CUDA_ARCHITECTURES "89;89-virtual")
 project(learncuda LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -22,3 +22,9 @@ set_target_properties(learncuda PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)
 
 target_link_libraries(learncuda PRIVATE CUDA::cudart ${OpenCV_LIBS})
+
+target_compile_options(learncuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info --keep>
+        $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_89,code=sm_89>
+        $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_89,code=compute_89>
+)
