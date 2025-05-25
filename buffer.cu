@@ -33,8 +33,7 @@ __device__ void print_matrix(float matrix[M][N]) {
     if (threadIdx.x + threadIdx.y == 0 && blockIdx.x + blockIdx.y == 0){ \
         expr                                                             \
     }                                                                    \
-}                                                                        \
-
+}
 
 template<
     typename T,
@@ -213,8 +212,69 @@ __device__ __forceinline__ void load_data_to_shared_matrix_B_async(
 
         B_shared_pipeline.producer_commit();
     }
+}
 
 
+template<
+    typename T,
+    size_t BLOCK_TILE_SIZE_Y,
+    size_t BLOCK_TILE_SIZE_K,
+    size_t THREADS_PER_BLOCK,
+    size_t COPY_ITERATIONS,
+    size_t BLOCK_TILE_SKEW_K = 0
+>
+__device__ __forceinline__ void load_data_to_shared_matrix_A(
+    T A_shared[BLOCK_TILE_SIZE_Y][BLOCK_TILE_SIZE_K + BLOCK_TILE_SKEW_K],
+    const T *A_matrix,
+    const size_t m,
+    const size_t k,
+    const size_t leading_dimension,
+    const uint iteration,
+    const uint thread_linear_idx,
+    cuda::pipeline<cuda::thread_scope_thread> &A_shared_pipeline
+) {
+    // ensures even amount of copies per thread
+    static_assert(BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_Y % THREADS_PER_BLOCK == 0);
+
+    // determines how many copies are performed per thread
+    constexpr size_t copy_iterations{
+        ceil_div(BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_Y, THREADS_PER_BLOCK)
+    };
+
+    static_assert(copy_iterations == COPY_ITERATIONS);
+
+#pragma unroll
+    for (size_t copy_iter{0}; copy_iter < COPY_ITERATIONS; ++copy_iter) {
+        const size_t shared_row{
+            (thread_linear_idx + copy_iter * THREADS_PER_BLOCK) / BLOCK_TILE_SIZE_K
+        };
+
+        const size_t shared_column{
+            (thread_linear_idx + copy_iter * THREADS_PER_BLOCK) % BLOCK_TILE_SIZE_K
+        };
+
+        const size_t A_row{BLOCK_TILE_SIZE_Y * blockIdx.y + shared_row};
+        const size_t A_column{iteration * BLOCK_TILE_SIZE_K + shared_column};
+
+        T value{static_cast<T>(0)};
+        const T *p_value;
+
+        if (A_row < m && A_column < k)
+            p_value = A_matrix + (leading_dimension * A_row + A_column);
+        else
+            p_value = &value;
+
+        A_shared_pipeline.producer_acquire();
+
+        cuda::memcpy_async(
+            &A_shared[shared_row][shared_column],
+            p_value,
+            sizeof(T),
+            A_shared_pipeline
+        );
+
+        A_shared_pipeline.producer_commit();
+    }
 }
 
 template<
@@ -280,6 +340,26 @@ __device__ __forceinline__ void load_data_to_shared_matrix_A_transposed_async(
 }
 
 template<
+    bool TRANSPOSED_A,
+    size_t BLOCK_TILE_SIZE_Y,
+    size_t BLOCK_TILE_SIZE_K,
+    size_t Y_SKEW,
+    size_t K_SKEW,
+    bool IS_ROW>
+constexpr uint A_shared_dim() {
+    if constexpr (TRANSPOSED_A) {
+        if constexpr (IS_ROW)
+            return BLOCK_TILE_SIZE_K + K_SKEW;
+        else
+            return BLOCK_TILE_SIZE_Y + Y_SKEW;
+    } else {
+        if constexpr (IS_ROW)
+            return BLOCK_TILE_SIZE_Y + Y_SKEW;
+        else return BLOCK_TILE_SIZE_K + K_SKEW;
+    }
+}
+
+template<
     typename T,
     size_t BLOCK_TILE_SIZE_X,
     size_t BLOCK_TILE_SIZE_Y,
@@ -288,10 +368,25 @@ template<
     size_t COPY_ITERATIONS_A,
     size_t COPY_ITERATIONS_B,
     size_t BLOCK_TILE_SKEW_X = 0,
-    size_t BLOCK_TILE_SKEW_Y = 0
+    size_t BLOCK_TILE_SKEW_Y = 0,
+    size_t BLOCK_TILE_SKEW_K = 0,
+    bool TRANSPOSE_A = true
 >
 __device__ void load_data_to_shared_async(
-    T A_shared_T[BLOCK_TILE_SIZE_K][BLOCK_TILE_SIZE_Y + BLOCK_TILE_SKEW_Y],
+    T A_shared[A_shared_dim<
+        TRANSPOSE_A,
+        BLOCK_TILE_SIZE_Y,
+        BLOCK_TILE_SIZE_K,
+        BLOCK_TILE_SKEW_Y,
+        BLOCK_TILE_SKEW_K,
+        true>()]
+    [A_shared_dim<
+        TRANSPOSE_A,
+        BLOCK_TILE_SIZE_Y,
+        BLOCK_TILE_SIZE_K,
+        BLOCK_TILE_SKEW_Y,
+        BLOCK_TILE_SKEW_K,
+        false>()],
     T B_shared[BLOCK_TILE_SIZE_K][BLOCK_TILE_SIZE_X + BLOCK_TILE_SKEW_X],
     const T *A_matrix,
     const T *B_matrix,
@@ -305,20 +400,37 @@ __device__ void load_data_to_shared_async(
     cuda::pipeline<cuda::thread_scope_thread> &A_shared_pipeline,
     cuda::pipeline<cuda::thread_scope_thread> &B_shared_pipeline
 ) {
-    load_data_to_shared_matrix_A_transposed_async<
-        T, BLOCK_TILE_SIZE_Y, BLOCK_TILE_SIZE_K,
-        THREADS_PER_BLOCK, COPY_ITERATIONS_A,
-        BLOCK_TILE_SKEW_Y
-    >(
-        A_shared_T,
-        A_matrix,
-        k,
-        m,
-        leading_dimension_A,
-        iteration,
-        thread_linear_idx,
-        A_shared_pipeline
-    );
+    if constexpr (TRANSPOSE_A) {
+        load_data_to_shared_matrix_A_transposed_async<
+            T, BLOCK_TILE_SIZE_Y, BLOCK_TILE_SIZE_K,
+            THREADS_PER_BLOCK, COPY_ITERATIONS_A,
+            BLOCK_TILE_SKEW_Y
+        >(
+            A_shared,
+            A_matrix,
+            k,
+            m,
+            leading_dimension_A,
+            iteration,
+            thread_linear_idx,
+            A_shared_pipeline
+        );
+    } else {
+        load_data_to_shared_matrix_A<
+            T, BLOCK_TILE_SIZE_Y, BLOCK_TILE_SIZE_K,
+            THREADS_PER_BLOCK, COPY_ITERATIONS_A,
+            BLOCK_TILE_SKEW_Y
+        >(
+            A_shared,
+            A_matrix,
+            k,
+            m,
+            leading_dimension_A,
+            iteration,
+            thread_linear_idx,
+            A_shared_pipeline
+        );
+    }
 
     load_data_to_shared_matrix_B_async<
         T, BLOCK_TILE_SIZE_X, BLOCK_TILE_SIZE_K,
@@ -1401,6 +1513,125 @@ __global__ void producer_consumer_pattern(
     }
 }
 
+template<
+    size_t TILE_SIZE_X,
+    size_t TILE_SIZE_Y,
+    size_t TILE_SIZE_K,
+    size_t STAGES = 2>
+__global__ void gemm_2DBT_async(
+    float *mat_A,
+    float *mat_B,
+    float *mat_C,
+    const size_t M,
+    const size_t N,
+    const size_t K,
+    const size_t A_stride,
+    const size_t B_stride,
+    const size_t C_stride) {
+    __shared__ float A_buffer[STAGES][TILE_SIZE_Y][TILE_SIZE_K];
+    __shared__ float B_buffer[STAGES][TILE_SIZE_K][TILE_SIZE_X];
+
+    const size_t total_iters{ceil_div(K, TILE_SIZE_K)};
+    const size_t thread_linear_idx{TILE_SIZE_X * threadIdx.y + threadIdx.x};
+
+    constexpr size_t total_threads{TILE_SIZE_X * TILE_SIZE_Y};
+
+    constexpr size_t A_priors{TILE_SIZE_Y * TILE_SIZE_K / total_threads};
+    constexpr size_t B_priors{TILE_SIZE_X * TILE_SIZE_K / total_threads};
+
+    const size_t C_col{TILE_SIZE_X * blockIdx.x + threadIdx.x};
+    const size_t C_row{TILE_SIZE_Y * blockIdx.y + threadIdx.y};
+
+    cuda::pipeline<cuda::thread_scope_thread> A_shared_pipeline{cuda::make_pipeline()};
+    cuda::pipeline<cuda::thread_scope_thread> B_shared_pipeline{cuda::make_pipeline()};
+
+    for (size_t stage{0}; stage < STAGES; ++stage) {
+        load_data_to_shared_async<
+            float,
+            TILE_SIZE_X,
+            TILE_SIZE_Y,
+            TILE_SIZE_K,
+            total_threads,
+            A_priors,
+            B_priors,
+            0,
+            0,
+            false
+        >(
+            A_buffer[stage],
+            B_buffer[stage],
+            mat_A,
+            mat_B,
+            K,
+            M,
+            N,
+            A_stride,
+            B_stride,
+            stage,
+            thread_linear_idx,
+            A_shared_pipeline,
+            B_shared_pipeline
+        );
+    }
+
+    size_t stage{0};
+    float partial{0.f};
+
+    for (size_t iter{0}; iter < total_iters; ++iter) {
+        cuda::pipeline_consumer_wait_prior<A_priors>(A_shared_pipeline);
+        cuda::pipeline_consumer_wait_prior<B_priors>(B_shared_pipeline);
+
+        __syncthreads();
+
+        for (size_t k{0}; k < TILE_SIZE_K; ++k) {
+            partial += A_buffer[stage][threadIdx.y][k] * B_buffer[stage][k][threadIdx.x];
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (size_t rel{0}; rel < A_priors; ++rel) {
+            A_shared_pipeline.consumer_release();
+        }
+
+#pragma unroll
+        for (size_t rel{0}; rel < B_priors; ++rel) {
+            B_shared_pipeline.consumer_release();
+        }
+
+        load_data_to_shared_async<
+            float,
+            TILE_SIZE_X,
+            TILE_SIZE_Y,
+            TILE_SIZE_K,
+            total_threads,
+            A_priors,
+            B_priors,
+            0,
+            0,
+            false
+        >(
+            A_buffer[stage],
+            B_buffer[stage],
+            mat_A,
+            mat_B,
+            K,
+            M,
+            N,
+            A_stride,
+            B_stride,
+            iter + 2,
+            thread_linear_idx,
+            A_shared_pipeline,
+            B_shared_pipeline
+        );
+
+        stage = (stage + 1) % STAGES;
+    }
+
+    if (C_col < N && C_row < M)
+        mat_C[C_stride * C_row + C_col] = partial;
+}
+
 
 // testing section
 //---------------------------------------------------------------------------------------------------------------------
@@ -1409,7 +1640,7 @@ template<
     size_t TILE_SIZE_X,
     size_t TILE_SIZE_Y,
     size_t TILE_SIZE_K>
-__global__ void shared_block_tile_regular(
+__global__ void gemm_2DBT(
     float *mat_A,
     float *mat_B,
     float *mat_C,
@@ -1633,7 +1864,7 @@ void test_double_buffer_gemm() {
     delete []host_C_2;
 }
 
-void test_regular_shared_mem() {
+void test_gemm_2DBT() {
     // const auto data{new float[10 * 8]};
     //
     // print_matrix(data, 10, 8, 8);
@@ -1682,7 +1913,91 @@ void test_regular_shared_mem() {
     constexpr dim3 block_dim(TILE_SIZE_X, TILE_SIZE_Y);
     const dim3 grid_dim(ceil_div(68, TILE_SIZE_X), ceil_div(211, TILE_SIZE_Y));
 
-    shared_block_tile_regular<
+    gemm_2DBT<
+        TILE_SIZE_X,
+        TILE_SIZE_Y,
+        TILE_SIZE_K><<<grid_dim, block_dim>>>(
+        dev_A,
+        dev_B,
+        dev_C,
+        211,
+        68,
+        35,
+        35,
+        68,
+        68
+    );
+
+    cudaDeviceSynchronize();
+
+    // Check for errors in kernel execution
+    if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess)
+        std::cerr << "CUDA error: " << cudaGetErrorString(error) << std::endl;
+
+    cudaMemcpy(host_C_2, dev_C, 211 * 68 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    test_equivalency(host_C, host_C_2, 211, 68, 68);
+
+    cudaFree(dev_A);
+    cudaFree(dev_B);
+    cudaFree(dev_C);
+
+    delete []host_A;
+    delete []host_B;
+    delete []host_C;
+    delete []host_C_2;
+}
+
+void test_gemm_2DBT_async() {
+    // const auto data{new float[10 * 8]};
+    //
+    // print_matrix(data, 10, 8, 8);
+
+    auto host_A{new float[211 * 35]};
+    auto host_B{new float[35 * 68]};
+    auto host_C{new float[211 * 68]};
+    auto host_C_2{new float[211 * 68]};
+
+    float *dev_A;
+    float *dev_B;
+    float *dev_C;
+
+    fill_matrix_w(host_A, 211, 35, 35, -100, 100);
+    fill_matrix_w(host_B, 35, 68, 68, -100, 100);
+    fill_matrix_w(host_C, 211, 68, 68, 0, 0);
+
+    cudaMalloc(&dev_A, 211 * 35 * sizeof(float));
+    cudaMalloc(&dev_B, 35 * 68 * sizeof(float));
+    cudaMalloc(&dev_C, 211 * 68 * sizeof(float));
+
+    cudaMemcpy(dev_A, host_A, 211 * 35 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_B, host_B, 35 * 68 * sizeof(float), cudaMemcpyHostToDevice);
+
+    cpu_matmul_naive(
+        host_A,
+        host_B,
+        host_C,
+        211,
+        68,
+        35,
+        35,
+        68,
+        68
+    );
+
+    constexpr size_t TILE_SIZE_X{16};
+    constexpr size_t TILE_SIZE_Y{16};
+    constexpr size_t TILE_SIZE_K{16};
+
+    constexpr size_t THREADS_PER_BLOCK{TILE_SIZE_X * TILE_SIZE_Y};
+
+    static_assert(TILE_SIZE_K * TILE_SIZE_X % THREADS_PER_BLOCK == 0);
+    static_assert(TILE_SIZE_K * TILE_SIZE_Y % THREADS_PER_BLOCK == 0);
+
+    constexpr dim3 block_dim(TILE_SIZE_X, TILE_SIZE_Y);
+    const dim3 grid_dim(ceil_div(68, TILE_SIZE_X), ceil_div(211, TILE_SIZE_Y));
+
+    gemm_2DBT_async<
         TILE_SIZE_X,
         TILE_SIZE_Y,
         TILE_SIZE_K><<<grid_dim, block_dim>>>(
@@ -1718,7 +2033,6 @@ void test_regular_shared_mem() {
 }
 
 void test_gemm_2DBT_2DWT_2DTT_vload() {
-
     auto host_A{new float[211 * 32]};
     auto host_B{new float[32 * 64]};
     auto host_C{new float[211 * 64]};
@@ -1850,8 +2164,6 @@ void test_async_load_gemm() {
     fill_matrix_w(host_A, m, k, k, -100, 100);
     fill_matrix_w(host_B, k, n, n, -100, 100);
     fill_matrix_w(host_C, m, n, n, 0, 0);
-
-    print_matrix(host_B, k, n, n);
 
     cudaMalloc(&dev_A, m * k * sizeof(float));
     cudaMalloc(&dev_B, k * n * sizeof(float));
@@ -2096,7 +2408,7 @@ void time_shared_memory() {
     for (int i{0}; i < 371; ++i) {
         float milliseconds = 0;
         cudaEventRecord(start);
-        shared_block_tile_regular<
+        gemm_2DBT<
             TILE_SIZE_X,
             TILE_SIZE_Y,
             TILE_SIZE_K><<<grid_dim, block_dim>>>(
@@ -2504,10 +2816,11 @@ void run_double_buffer_test() {
     // test_regular_shared_mem();
     // test_double_buffer_gemm();
     // time_db_gemm_memory();
+    test_gemm_2DBT_async();
     // test_async_load_gemm();
     // time_shared_memory();
-    time_gemm_2DBT_2DWT_2DTT_vload();
-    time_gemm_2DBT_2DWT_2DTT_async();
+    // time_gemm_2DBT_2DWT_2DTT_vload();
+    // time_gemm_2DBT_2DWT_2DTT_async();
     // test_gemm_2DBT_2DWT_2DTT_vload();
     // time_double_buffer();
 }
