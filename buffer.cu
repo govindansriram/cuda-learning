@@ -7,6 +7,7 @@
 #include <cuda/barrier>
 #include <cuda/pipeline>
 #include <random>
+#include "ptx_helpers.cuh"
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 
@@ -150,6 +151,8 @@ __device__ void load_data_to_shared_memory_transposed_vectorized(
     }
 }
 
+__device__ char ZEROS[16];
+
 // TODO see if vectorized copies are better (16 bytes at at time)
 // only possible for B matrices
 template<
@@ -157,7 +160,6 @@ template<
     size_t BLOCK_TILE_SIZE_X,
     size_t BLOCK_TILE_SIZE_K,
     size_t THREADS_PER_BLOCK,
-    size_t COPY_ITERATIONS,
     size_t BLOCK_TILE_SKEW_X = 0,
     size_t LOAD_BYTES = 4
 >
@@ -168,8 +170,7 @@ __device__ __forceinline__ void load_data_to_shared_matrix_B_async(
     const size_t n,
     const size_t leading_dimension,
     const uint iteration,
-    const uint thread_linear_idx,
-    cuda::pipeline<cuda::thread_scope_thread> &B_shared_pipeline
+    const uint thread_linear_idx
 ) {
     // ensures even amount of copies per thread
     static_assert(BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_X % THREADS_PER_BLOCK == 0);
@@ -183,14 +184,12 @@ __device__ __forceinline__ void load_data_to_shared_matrix_B_async(
         ceil_div(BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_X / units_per_load, THREADS_PER_BLOCK)
     };
 
-    static_assert(copy_iterations == COPY_ITERATIONS);
-
     constexpr size_t vec_block_tile_size_x{BLOCK_TILE_SIZE_X / units_per_load};
 
     // assert(leading_dimension % units_per_load == 0);
 
 #pragma unroll
-    for (size_t copy_iter{0}; copy_iter < COPY_ITERATIONS; ++copy_iter) {
+    for (size_t copy_iter{0}; copy_iter < copy_iterations; ++copy_iter) {
         const size_t shared_row{
             (thread_linear_idx + copy_iter * THREADS_PER_BLOCK) / vec_block_tile_size_x
         };
@@ -208,18 +207,13 @@ __device__ __forceinline__ void load_data_to_shared_matrix_B_async(
         if (B_row < k && B_column < n)
             p_value = B_matrix + (leading_dimension * B_row + B_column);
         else
-            p_value = static_cast<const T *>(value);
+            p_value = reinterpret_cast<const T *>(ZEROS);
 
-        B_shared_pipeline.producer_acquire();
-
-        cuda::memcpy_async(
+        CP_ASYNC_LARGE(
             &B_shared[shared_row][shared_column],
-            p_value,
-            LOAD_BYTES,
-            B_shared_pipeline
+            p_value
         );
 
-        B_shared_pipeline.producer_commit();
     }
 }
 
@@ -229,8 +223,8 @@ template<
     size_t BLOCK_TILE_SIZE_Y,
     size_t BLOCK_TILE_SIZE_K,
     size_t THREADS_PER_BLOCK,
-    size_t COPY_ITERATIONS,
-    size_t BLOCK_TILE_SKEW_K = 0
+    size_t BLOCK_TILE_SKEW_K = 0,
+    size_t LOAD_BYTES = 4
 >
 __device__ __forceinline__ void load_data_to_shared_matrix_A_async(
     T A_shared[BLOCK_TILE_SIZE_Y][BLOCK_TILE_SIZE_K + BLOCK_TILE_SKEW_K],
@@ -239,50 +233,42 @@ __device__ __forceinline__ void load_data_to_shared_matrix_A_async(
     const size_t k,
     const size_t leading_dimension,
     const uint iteration,
-    const uint thread_linear_idx,
-    cuda::pipeline<cuda::thread_scope_thread> &A_shared_pipeline
+    const uint thread_linear_idx
 ) {
     // ensures even amount of copies per thread
     static_assert(BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_Y % THREADS_PER_BLOCK == 0);
 
+    constexpr size_t units_per_load(LOAD_BYTES / sizeof(T));
+
     // determines how many copies are performed per thread
     constexpr size_t copy_iterations{
-        ceil_div(BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_Y, THREADS_PER_BLOCK)
+        ceil_div(BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_Y / units_per_load, THREADS_PER_BLOCK)
     };
 
-    static_assert(copy_iterations == COPY_ITERATIONS);
+    constexpr size_t vectorized_block_tile_size_k{BLOCK_TILE_SIZE_K / units_per_load};
 
 #pragma unroll
-    for (size_t copy_iter{0}; copy_iter < COPY_ITERATIONS; ++copy_iter) {
+    for (size_t copy_iter{0}; copy_iter < copy_iterations; ++copy_iter) {
         const size_t shared_row{
-            (thread_linear_idx + copy_iter * THREADS_PER_BLOCK) / BLOCK_TILE_SIZE_K
+            (thread_linear_idx + copy_iter * THREADS_PER_BLOCK) / vectorized_block_tile_size_k
         };
 
         const size_t shared_column{
-            (thread_linear_idx + copy_iter * THREADS_PER_BLOCK) % BLOCK_TILE_SIZE_K
+            (thread_linear_idx + copy_iter * THREADS_PER_BLOCK) % vectorized_block_tile_size_k * units_per_load
         };
 
         const size_t A_row{BLOCK_TILE_SIZE_Y * blockIdx.y + shared_row};
         const size_t A_column{iteration * BLOCK_TILE_SIZE_K + shared_column};
 
-        T value{static_cast<T>(0)};
+        T value[units_per_load];
         const T *p_value;
 
         if (A_row < m && A_column < k)
             p_value = A_matrix + (leading_dimension * A_row + A_column);
         else
-            p_value = &value;
+            p_value = reinterpret_cast<const T *>(ZEROS);
 
-        A_shared_pipeline.producer_acquire();
-
-        cuda::memcpy_async(
-            &A_shared[shared_row][shared_column],
-            p_value,
-            sizeof(T),
-            A_shared_pipeline
-        );
-
-        A_shared_pipeline.producer_commit();
+        CP_ASYNC_LARGE(&A_shared[shared_row][shared_column], p_value);
     }
 }
 
@@ -291,7 +277,6 @@ template<
     size_t BLOCK_TILE_SIZE_Y,
     size_t BLOCK_TILE_SIZE_K,
     size_t THREADS_PER_BLOCK,
-    size_t COPY_ITERATIONS,
     size_t BLOCK_TILE_SKEW_Y = 0
 >
 __device__ __forceinline__ void load_data_to_shared_matrix_A_transposed_async(
@@ -301,8 +286,7 @@ __device__ __forceinline__ void load_data_to_shared_matrix_A_transposed_async(
     const size_t m,
     const size_t leading_dimension,
     const uint iteration,
-    const uint thread_linear_idx,
-    cuda::pipeline<cuda::thread_scope_thread> &A_shared_pipeline
+    const uint thread_linear_idx
 ) {
     // ensures even amount of copies per thread
     static_assert(BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_Y % THREADS_PER_BLOCK == 0);
@@ -311,8 +295,6 @@ __device__ __forceinline__ void load_data_to_shared_matrix_A_transposed_async(
     constexpr size_t copy_iterations{
         ceil_div(BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_Y, THREADS_PER_BLOCK)
     };
-
-    static_assert(copy_iterations == COPY_ITERATIONS);
 
 #pragma unroll
     for (size_t copy_iter{0}; copy_iter < copy_iterations; ++copy_iter) {
@@ -333,18 +315,9 @@ __device__ __forceinline__ void load_data_to_shared_matrix_A_transposed_async(
         if (A_row < m && A_column < k)
             p_value = A_matrix + (leading_dimension * A_row + A_column);
         else
-            p_value = &value;
+            p_value = ZEROS;
 
-        A_shared_pipeline.producer_acquire();
-
-        cuda::memcpy_async(
-            &A_shared_T[shared_column][shared_row],
-            p_value,
-            sizeof(T),
-            A_shared_pipeline
-        );
-
-        A_shared_pipeline.producer_commit();
+        CP_ASYNC_SMALL(&A_shared_T[shared_column][shared_row], p_value, 4);
     }
 }
 
@@ -374,12 +347,11 @@ template<
     size_t BLOCK_TILE_SIZE_Y,
     size_t BLOCK_TILE_SIZE_K,
     size_t THREADS_PER_BLOCK,
-    size_t COPY_ITERATIONS_A,
-    size_t COPY_ITERATIONS_B,
     size_t BLOCK_TILE_SKEW_X = 0,
     size_t BLOCK_TILE_SKEW_Y = 0,
     size_t BLOCK_TILE_SKEW_K = 0,
     bool TRANSPOSE_A = true,
+    size_t LOAD_A_BYTES=4,
     size_t LOAD_B_BYTES=4
 >
 __device__ void load_data_to_shared_async(
@@ -406,15 +378,12 @@ __device__ void load_data_to_shared_async(
     const size_t leading_dimension_A,
     const size_t leading_dimension_B,
     const uint iteration,
-    const uint thread_linear_idx,
-    cuda::pipeline<cuda::thread_scope_thread> &A_shared_pipeline,
-    cuda::pipeline<cuda::thread_scope_thread> &B_shared_pipeline
+    const uint thread_linear_idx
 ) {
     if constexpr (TRANSPOSE_A) {
         load_data_to_shared_matrix_A_transposed_async<
             T, BLOCK_TILE_SIZE_Y, BLOCK_TILE_SIZE_K,
-            THREADS_PER_BLOCK, COPY_ITERATIONS_A,
-            BLOCK_TILE_SKEW_Y
+            THREADS_PER_BLOCK, BLOCK_TILE_SKEW_Y
         >(
             A_shared,
             A_matrix,
@@ -422,14 +391,12 @@ __device__ void load_data_to_shared_async(
             m,
             leading_dimension_A,
             iteration,
-            thread_linear_idx,
-            A_shared_pipeline
-        );
+            thread_linear_idx);
     } else {
         load_data_to_shared_matrix_A_async<
             T, BLOCK_TILE_SIZE_Y, BLOCK_TILE_SIZE_K,
-            THREADS_PER_BLOCK, COPY_ITERATIONS_A,
-            BLOCK_TILE_SKEW_Y
+            THREADS_PER_BLOCK, BLOCK_TILE_SKEW_Y,
+            LOAD_A_BYTES
         >(
             A_shared,
             A_matrix,
@@ -437,15 +404,14 @@ __device__ void load_data_to_shared_async(
             k,
             leading_dimension_A,
             iteration,
-            thread_linear_idx,
-            A_shared_pipeline
+            thread_linear_idx
         );
     }
-
+    CP_ASYNC_COMMIT_GROUP;
     load_data_to_shared_matrix_B_async<
         T, BLOCK_TILE_SIZE_X, BLOCK_TILE_SIZE_K,
-        THREADS_PER_BLOCK, COPY_ITERATIONS_B,
-        BLOCK_TILE_SKEW_X, LOAD_B_BYTES
+        THREADS_PER_BLOCK, BLOCK_TILE_SKEW_X,
+        LOAD_B_BYTES
     >(
         B_shared,
         B_matrix,
@@ -453,9 +419,9 @@ __device__ void load_data_to_shared_async(
         n,
         leading_dimension_B,
         iteration,
-        thread_linear_idx,
-        B_shared_pipeline
+        thread_linear_idx
     );
+    CP_ASYNC_COMMIT_GROUP;
 }
 
 template<
@@ -764,7 +730,7 @@ __global__ void gemm_2DBT_2DWT_2DTT_async_load(
     const size_t leading_dim_B,
     const size_t leading_dim_C) {
     // two buffer present compute loading overlap
-    __shared__ T shared_A_T[STAGES][BLOCK_TILE_SIZE_K][BLOCK_TILE_SIZE_Y];
+    __shared__ T shared_A[STAGES][BLOCK_TILE_SIZE_Y][BLOCK_TILE_SIZE_K];
     __shared__ T shared_B[STAGES][BLOCK_TILE_SIZE_K][BLOCK_TILE_SIZE_X];
 
     // One Warp TILE will be of size WARP_TILE_SIZE_X x WARP_TILE_SIZE_Y
@@ -866,26 +832,17 @@ __global__ void gemm_2DBT_2DWT_2DTT_async_load(
 
     // This determines how many vectorized loads we need to perform to fill one tile
     constexpr size_t vectorized_thread_tile_size_x{THREAD_TILE_SIZE_X / units_per_vector};
-    constexpr size_t vectorized_thread_tile_size_y{THREAD_TILE_SIZE_Y / units_per_vector};
 
     const size_t total_iters{ceil_div(k, BLOCK_TILE_SIZE_K)};
-
-    // calculate acquires per load to shared
-    constexpr size_t A_priors{BLOCK_TILE_SIZE_Y * BLOCK_TILE_SIZE_K / THREADS_PER_BLOCK};
-    constexpr size_t B_priors{BLOCK_TILE_SIZE_X * BLOCK_TILE_SIZE_K / 4 / THREADS_PER_BLOCK};
-
-    cuda::pipeline<cuda::thread_scope_thread> A_shared_pipeline{cuda::make_pipeline()};
-    cuda::pipeline<cuda::thread_scope_thread> B_shared_pipeline{cuda::make_pipeline()};
 
     // preload both buffers
     for (size_t stage{0}; stage < STAGES; ++stage) {
         load_data_to_shared_async<
             T, BLOCK_TILE_SIZE_X,
             BLOCK_TILE_SIZE_Y, BLOCK_TILE_SIZE_K,
-            THREADS_PER_BLOCK, A_priors, B_priors,
-            0, 0, 0, true, 16
+            THREADS_PER_BLOCK, 0, 0, 0, false, 16, 16
         >(
-            shared_A_T[stage],
+            shared_A[stage],
             shared_B[stage],
             matrix_A,
             matrix_B,
@@ -895,24 +852,16 @@ __global__ void gemm_2DBT_2DWT_2DTT_async_load(
             leading_dim_A,
             leading_dim_B,
             stage,
-            thread_linear_idx,
-            A_shared_pipeline,
-            B_shared_pipeline
+            thread_linear_idx
         );
     }
 
     size_t stage{0};
 
-    // CUDA_0_EXPR(
-    //     printf("total iters %lld", total_iters);
-    // );
-
     for (size_t iter{0}; iter < total_iters; ++iter) {
-        cuda::pipeline_consumer_wait_prior<A_priors>(A_shared_pipeline);
-        cuda::pipeline_consumer_wait_prior<B_priors>(B_shared_pipeline);
 
+        CP_ASYNC_WAIT(2);
         // print_matrix<BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_X>(shared_B[stage]);
-
         __syncthreads();
 
         // #pragma unroll
@@ -943,18 +892,10 @@ __global__ void gemm_2DBT_2DWT_2DTT_async_load(
                     thread_idx_in_warp_row * THREAD_TILE_SIZE_Y
                 };
 
-                const auto one_shared_ptr{
-                    reinterpret_cast<int4 *>(&shared_A_T[stage][kk][one_shared_row_idx])
-                };
-
-                auto tile_ptr{
-                    reinterpret_cast<int4 *>(&one_cache[y_cache_idx])
-                };
-
                 // load into register cache one[y_cache_idx] with vectorized loads
                 // #pragma unroll
-                for (size_t vy_iter{0}; vy_iter < vectorized_thread_tile_size_y; ++vy_iter)
-                    tile_ptr[vy_iter] = one_shared_ptr[vy_iter];
+                for (size_t y_idx{0}; y_idx < THREAD_TILE_SIZE_Y; ++y_idx)
+                    one_cache[y_cache_idx][y_idx] = shared_A[stage][one_shared_row_idx + y_idx][kk];
             }
 
 #pragma unroll
@@ -997,24 +938,13 @@ __global__ void gemm_2DBT_2DWT_2DTT_async_load(
         }
         __syncthreads();
 
-#pragma unroll
-        for (size_t rel{0}; rel < A_priors; ++rel) {
-            A_shared_pipeline.consumer_release();
-        }
-
-#pragma unroll
-        for (size_t rel{0}; rel < B_priors; ++rel) {
-            B_shared_pipeline.consumer_release();
-        }
-
         if (iter < total_iters - 2) {
             load_data_to_shared_async<
                 T, BLOCK_TILE_SIZE_X,
                 BLOCK_TILE_SIZE_Y, BLOCK_TILE_SIZE_K,
-                THREADS_PER_BLOCK, A_priors, B_priors,
-                0, 0, 0, true, 16
+                THREADS_PER_BLOCK, 0, 0, 0, false, 16, 16
             >(
-                shared_A_T[stage],
+                shared_A[stage],
                 shared_B[stage],
                 matrix_A,
                 matrix_B,
@@ -1024,9 +954,7 @@ __global__ void gemm_2DBT_2DWT_2DTT_async_load(
                 leading_dim_A,
                 leading_dim_B,
                 iter + 2,
-                thread_linear_idx,
-                A_shared_pipeline,
-                B_shared_pipeline
+                thread_linear_idx
             );
         }
 
@@ -1548,14 +1476,8 @@ __global__ void gemm_2DBT_async(
 
     constexpr size_t total_threads{TILE_SIZE_X * TILE_SIZE_Y};
 
-    constexpr size_t A_priors{TILE_SIZE_Y * TILE_SIZE_K / total_threads};
-    constexpr size_t B_priors{TILE_SIZE_X * TILE_SIZE_K / total_threads};
-
     const size_t C_col{TILE_SIZE_X * blockIdx.x + threadIdx.x};
     const size_t C_row{TILE_SIZE_Y * blockIdx.y + threadIdx.y};
-
-    cuda::pipeline<cuda::thread_scope_thread> A_shared_pipeline{cuda::make_pipeline()};
-    cuda::pipeline<cuda::thread_scope_thread> B_shared_pipeline{cuda::make_pipeline()};
 
     for (size_t stage{0}; stage < STAGES; ++stage) {
         load_data_to_shared_async<
@@ -1564,8 +1486,6 @@ __global__ void gemm_2DBT_async(
             TILE_SIZE_Y,
             TILE_SIZE_K,
             total_threads,
-            A_priors,
-            B_priors,
             0,
             0,
             0,
@@ -1581,9 +1501,7 @@ __global__ void gemm_2DBT_async(
             A_stride,
             B_stride,
             stage,
-            thread_linear_idx,
-            A_shared_pipeline,
-            B_shared_pipeline
+            thread_linear_idx
         );
     }
 
@@ -1591,9 +1509,7 @@ __global__ void gemm_2DBT_async(
     float partial{0.f};
 
     for (size_t iter{0}; iter < total_iters; ++iter) {
-        cuda::pipeline_consumer_wait_prior<A_priors>(A_shared_pipeline);
-        cuda::pipeline_consumer_wait_prior<B_priors>(B_shared_pipeline);
-
+        CP_ASYNC_WAIT(2);
         __syncthreads();
 
         for (size_t k{0}; k < TILE_SIZE_K; ++k) {
@@ -1601,15 +1517,6 @@ __global__ void gemm_2DBT_async(
         }
         __syncthreads();
 
-#pragma unroll
-        for (size_t rel{0}; rel < A_priors; ++rel) {
-            A_shared_pipeline.consumer_release();
-        }
-
-#pragma unroll
-        for (size_t rel{0}; rel < B_priors; ++rel) {
-            B_shared_pipeline.consumer_release();
-        }
 
         load_data_to_shared_async<
             float,
@@ -1617,8 +1524,6 @@ __global__ void gemm_2DBT_async(
             TILE_SIZE_Y,
             TILE_SIZE_K,
             total_threads,
-            A_priors,
-            B_priors,
             0,
             0,
             0,
@@ -1634,9 +1539,7 @@ __global__ void gemm_2DBT_async(
             A_stride,
             B_stride,
             iter + 2,
-            thread_linear_idx,
-            A_shared_pipeline,
-            B_shared_pipeline
+            thread_linear_idx
         );
 
         stage = (stage + 1) % STAGES;
