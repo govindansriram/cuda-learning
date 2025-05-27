@@ -17,3 +17,8 @@ TEST(G_2DBT_2DWT_2DTT_VLOAD, GEMM) {
 TEST(G_2DBT_2DWT_2DTT_ASYNC, GEMM) {
     test_gemm_2DBT_2DWT_2DTT_async();
 }
+
+TEST(G_2DBT_2DWT_2DTT_ASYNC_A_TRANSPOSED, GEMM) {
+    test_gemm_2DBT_2DWT_2DTT_async_a_transposed();
+}
+
