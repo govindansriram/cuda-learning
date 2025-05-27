@@ -41,7 +41,6 @@ set(COMMON_TEST_SOURCES
 
 set(GEMM_SOURCES
         ${COMMON_SRC_SOURCES}
-#        src/gemm/gemm.cu
         src/gemm/gemm.cuh
 )
 
@@ -49,8 +48,9 @@ add_executable(
         benchmark_gemm
         ${GEMM_SOURCES}
         ${COMMON_BENCH_SOURCES}
-        benchmark/gemm/main.cpp
+        benchmark/gemm/bench_gemm_main.cpp
         benchmark/gemm/bench_gemm.cu
+        benchmark/gemm/bench_gemm.h
 )
 
 add_executable(
