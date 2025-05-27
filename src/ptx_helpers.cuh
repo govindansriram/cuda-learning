@@ -16,6 +16,8 @@
 // https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/arch/memory_sm80.h
 
 
+// IMPORTANT whenever using an api that uses "n", ensure that you use a literal constant
+
 # define CP_ASYNC_SMALL(shared_P, global_P, amt)                                                             \
     {                                                                                                        \
         static_assert(amt == 4 || amt == 8);                                                                 \

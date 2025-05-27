@@ -11,20 +11,82 @@ find_package(CUDAToolkit REQUIRED)
 # Find OpenCV package (ensure OpenCV is installed on your system)
 find_package(OpenCV REQUIRED)
 
+include(FetchContent)
+FetchContent_Declare(
+        googletest
+        URL https://github.com/google/googletest/archive/b514bdc898e2951020cbdca1304b75f5950d1f59.zip
+)
+
+FetchContent_MakeAvailable(googletest)
+
 include_directories(CUDA::toolkit)
 
 # Include OpenCV directories
 include_directories(${OpenCV_INCLUDE_DIRS})
 
-add_executable(learncuda main.cpp api.cu api.h buffer.cu ptx.cu ptx_helpers.cuh)
-
-set_target_properties(learncuda PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON)
-
-target_link_libraries(learncuda PRIVATE CUDA::cudart ${OpenCV_LIBS})
-
-target_compile_options(learncuda PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info --keep>
-        $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_89,code=sm_89>
-        $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_89,code=compute_89>
+set(COMMON_SRC_SOURCES
+        src/helpers.cuh
+        src/ptx_helpers.cuh
 )
+
+set(COMMON_BENCH_SOURCES
+        benchmark/bench_helpers.h
+        benchmark/bench_helpers.cpp
+)
+
+set(COMMON_TEST_SOURCES
+        test/test_helpers.cpp
+        test/test_helpers.h
+)
+
+set(GEMM_SOURCES
+        ${COMMON_SRC_SOURCES}
+#        src/gemm/gemm.cu
+        src/gemm/gemm.cuh
+)
+
+add_executable(
+        benchmark_gemm
+        ${GEMM_SOURCES}
+        ${COMMON_BENCH_SOURCES}
+        benchmark/gemm/main.cpp
+        benchmark/gemm/bench_gemm.cu
+)
+
+add_executable(
+        test_gemm
+        ${GEMM_SOURCES}
+        ${COMMON_TEST_SOURCES}
+        test/gemm/test_gemm.cu
+        test/gemm/test_gemm_main.cpp
+        test/gemm/test_gemm.h
+)
+
+function(setup_cuda_target target_name)
+    cmake_parse_arguments(
+            ARG                        # Prefix for parsed args (can be empty)
+            "WITH_GTEST"               # Optional single-value flags
+            ""                         # Optional single-value args (none)
+            ""                         # Optional multi-value args (none)
+            ${ARGN}                    # Remaining arguments passed to the function
+    )
+
+    set_target_properties(${target_name} PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+    )
+
+    if(ARG_WITH_GTEST)
+        target_link_libraries(${target_name} PRIVATE CUDA::cudart ${OpenCV_LIBS} gtest GTest::gtest_main)
+    else()
+        target_link_libraries(${target_name} PRIVATE CUDA::cudart ${OpenCV_LIBS})
+    endif()
+
+    target_compile_options(${target_name} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info --keep>
+            $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_89,code=sm_89>
+            $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_89,code=compute_89>
+    )
+endfunction()
+
+setup_cuda_target(benchmark_gemm)
+setup_cuda_target(test_gemm WITH_GTEST)
