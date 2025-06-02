@@ -336,25 +336,6 @@ CUTE_DEVICE void load_to_shared(
     constexpr size_t A_loads_per_thread{smem_length_A / thread_length};
     constexpr size_t B_loads_per_thread{smem_length_B / thread_length};
 
-    // constexpr auto tv_layout_A{
-    //     make_layout(
-    //         make_shape(Int<cosize_v<THREAD_LAYOUT>>{}, Int<A_loads_per_thread>{}),
-    //         make_stride(_1{}, Int<cosize_v<THREAD_LAYOUT>>{})
-    //         )
-    // };
-
-    // constexpr auto tv_layout_A{
-    //     make_layout(
-    //         make_shape(make_shape(_16{}, _2{}), _8{}),
-    //         make_shape(make_stride(_16{}, _8{}), _1{})
-    //         // make_stride(Int<cosize_v<THREAD_LAYOUT>>{}, _1{})
-    //         )
-    // };
-
-    // TODO make it completely constexpr
-
-    // constexpr size_t global_size_A{size<0>(A_GLOBAL_LAYOUT{})};
-
     constexpr auto tv_layout_A{
         make_layout(
             make_shape(make_shape(size<1>(A_GLOBAL_LAYOUT{}),
@@ -375,14 +356,6 @@ CUTE_DEVICE void load_to_shared(
     const Tensor global_A_tv{composition(global_A, tv_layout_A)};
     const Tensor global_B_tv{composition(global_B, tv_layout_B)};
 
-    // if (threadIdx.x == 16 && blockIdx.x + blockIdx.y == 0) {
-    //     print_layout(tv_layout_B.layout());
-    //     printf("\n\n");
-    //     print_layout(B_SHARED_LAYOUT{});
-    //     printf("\n\n");
-    //     print_layout(shared_B_tv.layout());
-    // }
-
     const Tensor global_A_value{global_A_tv(threadIdx.x, _)};
     Tensor shared_A_value{shared_A_tv(threadIdx.x, _)};
 
@@ -391,18 +364,6 @@ CUTE_DEVICE void load_to_shared(
 
     copy(global_A_value, shared_A_value);
     copy(global_B_value, shared_B_value);
-
-    // if (threadIdx.x == 16 && blockIdx.x + blockIdx.y == 0) {
-    //     // print(global_B);
-    //     // print_layout(global_B.layout());
-    //     // print(global_B_tv);
-    //     printf("\n");
-    //     print_layout(global_A.layout());
-    //     print(global_A_value);
-    //     printf("%f", shared_A_value(0));
-    // }
-
-    // copy(global_B_tv(threadIdx.x, _), shared_B_tv(threadIdx.x, _));
 }
 
 template<
@@ -468,34 +429,24 @@ __global__ static void gemm_2DBT(
     const size_t col{coords.rest_.first_};
 
     for (size_t iter{0}; iter < total_iters; ++iter) {
-        Tensor tile_A{gA_tiled(make_coord(_, _), make_coord(iter, blockIdx.y))};
+        Tensor tile_A{gA_tiled(make_coord(_, _), make_coord(blockIdx.y, iter))};
         Tensor tile_B{gB_tiled(make_coord(_, _), make_coord(iter, blockIdx.x))};
 
         // load to shared
         load_to_shared(shared_A, shared_B, tile_A, tile_B, thread_layout);
-
         __syncthreads();
 
-        if (threadIdx.x == 0 && blockIdx.x + blockIdx.y == 0) {
-            print2D_tensor(shared_B);
-            printf("\n");
+        Tensor slice_A{shared_A(make_coord(row, _))};
+        Tensor slice_B{shared_B(make_coord(_, col))};
 
-            print2D_tensor(shared_A);
+#pragma unroll
+        for (size_t kk{0}; kk < BLOCK_TILE_SIZE_K; ++kk) {
+            partial += slice_A(kk) * slice_B(kk);
         }
-
-        Tensor slice_A{shared_A(make_coord(_, row))};
-        Tensor slice_B{shared_B(make_coord(col, _))};
-
-// #pragma unroll
-//         for (size_t kk{0}; kk < BLOCK_TILE_SIZE_K; ++kk) {
-//             partial += slice_A(kk) * slice_B(kk);
-//         }
-//
-//         __syncthreads();
-         break;
+        __syncthreads();
     }
 
-    // tile_C(make_coord(col, row)) = tile_C(make_coord(col, col)) * beta + partial * alpha;
+    tile_C(make_coord(row, col)) = tile_C(make_coord(row, col)) * beta + partial * alpha;
 }
 
 void test_others() {
@@ -516,8 +467,9 @@ void test_others() {
     thrust::host_vector<float> host_matrixB(K * N);
     thrust::host_vector<float> host_matrixC(M * N);
 
-    for (size_t i{0}; i < M * K; ++i) host_matrixA[i] = static_cast<float>(i);
-    for (size_t i{0}; i < N * K; ++i) host_matrixB[i] = static_cast<float>(i);
+    fill_matrix_w(host_matrixA.data(), M, K, K, -100, 100);
+    fill_matrix_w(host_matrixB.data(), K, N, N, -100, 100);
+
     for (size_t i{0}; i < N * M; ++i) host_matrixC[i] = 0.f;
 
     thrust::device_vector<float> device_matrixA{host_matrixA};
@@ -533,7 +485,7 @@ void test_others() {
     constexpr Layout smem_A_lo{make_layout(make_shape(Int<BLOCK_TILE_SIZE_Y>{}, Int<BLOCK_TILE_SIZE_K>{}), LayoutRight{})};
     constexpr Layout smem_B_lo{make_layout(make_shape(Int<BLOCK_TILE_SIZE_K>{}, Int<BLOCK_TILE_SIZE_X>{}), LayoutRight{})};
     constexpr Layout thread_lo{
-        make_layout(make_shape(Int<4>{}, Int<8>{}), LayoutRight{})};
+        make_layout(make_shape(Int<16>{}, Int<16>{}), LayoutRight{})};
 
     constexpr size_t shared_mem_size{
         (BLOCK_TILE_SIZE_Y * BLOCK_TILE_SIZE_K) + (BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_X) * sizeof(float)
@@ -544,12 +496,8 @@ void test_others() {
         ceil_div(M, BLOCK_TILE_SIZE_Y)
     };
 
-    // dim3 block_dim{
-    //     BLOCK_TILE_SIZE_X * BLOCK_TILE_SIZE_Y
-    // };
-
     dim3 block_dim{
-        32
+        BLOCK_TILE_SIZE_X * BLOCK_TILE_SIZE_Y
     };
 
     gemm_2DBT<<<grid_dim, block_dim, shared_mem_size>>>(
@@ -564,4 +512,8 @@ void test_others() {
         thread_lo,
         1.f,
         1.f);
+
+    thrust::host_vector<float> host_matrixC2{device_matrixC};
+    cpu_matmul_naive(host_matrixA.data(), host_matrixB.data(), host_matrixC.data(), M, N, K, K, N, N);
+    test_equivalency(host_matrixC.data(), host_matrixC2.data(), M, N, N);
 }

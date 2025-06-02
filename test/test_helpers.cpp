@@ -34,6 +34,9 @@ void test_equivalency(
     const size_t stride) {
     for (size_t i{0}; i < M; ++i) {
         for (size_t j{0}; j < N; ++j) {
+            if (expected[i * stride + j] != result[i * stride + j]) {
+                std::cout << "row: " << i << " " << "column: " << j << std::endl;
+            }
             ASSERT_EQ(expected[i * stride + j], result[i * stride + j]);
         }
     }
