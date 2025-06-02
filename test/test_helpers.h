@@ -25,7 +25,24 @@ void test_equivalency(
 
 int generate_random_int(int min_val, int max_val);
 
+template <typename T>
 void fill_matrix_w(
+    T * matrix,
+    const size_t M,
+    const size_t N,
+    const size_t stride,
+    const int min_val,
+    const int max_val) {
+
+    for (size_t i{0}; i < M; ++i) {
+        for (size_t j{0}; j < N; ++j) {
+            matrix[i * stride + j] = static_cast<T>(generate_random_int(min_val, max_val));
+        }
+    }
+}
+
+template<>
+void fill_matrix_w<float>(
     float *matrix,
     size_t M,
     size_t N,

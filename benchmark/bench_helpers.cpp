@@ -4,6 +4,7 @@
 #include <cuda_runtime_api.h>
 #include <iostream>
 #include <random>
+#include "bench_helpers.h"
 
 void flush_l2_cache() {
     int dev_id{};

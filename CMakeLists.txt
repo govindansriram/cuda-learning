@@ -23,6 +23,8 @@ include_directories(CUDA::toolkit)
 
 # Include OpenCV directories
 include_directories(${OpenCV_INCLUDE_DIRS})
+include_directories(/home/sriram/Applications/cutlass/cutlass/include)
+include_directories(/home/sriram/Applications/cutlass/cutlass/tools/util/include)
 
 set(COMMON_SRC_SOURCES
         src/helpers.cuh
@@ -44,6 +46,11 @@ set(GEMM_SOURCES
         src/gemm/gemm.cuh
 )
 
+set(CUTLASS_GEMM_SOURCES
+        ${COMMON_SRC_SOURCES}
+        src/gemm/cutlass_gemm.cuh
+)
+
 add_executable(
         benchmark_gemm
         ${GEMM_SOURCES}
@@ -60,6 +67,15 @@ add_executable(
         test/gemm/test_gemm.cu
         test/gemm/test_gemm_main.cpp
         test/gemm/test_gemm.h
+)
+
+add_executable(
+        test_cutlass_gemm
+        ${CUTLASS_GEMM_SOURCES}
+        ${COMMON_TEST_SOURCES}
+        test/gemm/test_cutlass_gemm.cu
+        test/gemm/test_cutlass_gemm.h
+        test/gemm/test_cutlass_gemm_main.cpp
 )
 
 function(setup_cuda_target target_name)
@@ -90,3 +106,4 @@ endfunction()
 
 setup_cuda_target(benchmark_gemm)
 setup_cuda_target(test_gemm WITH_GTEST)
+setup_cuda_target(test_cutlass_gemm WITH_GTEST)

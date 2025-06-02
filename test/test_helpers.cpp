@@ -4,6 +4,7 @@
 
 #include <random>
 #include <gtest/gtest.h>
+#include "test_helpers.h"
 
 void cpu_matmul_naive(
     const float *mat_A,
@@ -45,6 +46,8 @@ int generate_random_int(const int min_val, const int max_val) {
     return dis(gen);
 }
 
+
+template<>
 void fill_matrix_w(
     float *matrix,
     const size_t M,

@@ -2,3 +2,7 @@ cmake-build-debug
 .idea/
 state
 state.ncu-rep
+test.tex
+test.aux
+test.log
+test.pdf
