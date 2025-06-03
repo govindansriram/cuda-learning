@@ -6,6 +6,10 @@
 #include <gtest/gtest.h>
 
 
-TEST(LAYOUT, cutlass) {
-    test_others();
+TEST(CUTE, cute_gemm_2DBT) {
+    test_cute_gemm_2DBT();
+}
+
+TEST(CUTE, test_cute_gemm_2DBT_2DWT_2DTT_vloadT) {
+    test_cute_gemm_2DBT_2DWT_2DTT_vloadT();
 }

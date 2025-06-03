@@ -5,8 +5,6 @@
 #ifndef TEST_CUTLASS_GEMM_H
 #define TEST_CUTLASS_GEMM_H
 
-void test_layout();
-void thread_value_partitioning();
-void test_others();
-
+void test_cute_gemm_2DBT();
+void test_cute_gemm_2DBT_2DWT_2DTT_vloadT();
 #endif //TEST_CUTLASS_GEMM_H
