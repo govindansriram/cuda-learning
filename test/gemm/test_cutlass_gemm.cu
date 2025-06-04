@@ -266,7 +266,7 @@ void test_cute_gemm_2DBT() {
     };
 
     constexpr size_t shared_mem_size{
-        (BLOCK_TILE_SIZE_Y * BLOCK_TILE_SIZE_K) + (BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_X) * sizeof(float)
+        ((BLOCK_TILE_SIZE_Y * BLOCK_TILE_SIZE_K) + (BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_X)) * sizeof(float)
     };
 
     dim3 grid_dim{
@@ -297,16 +297,29 @@ void test_cute_gemm_2DBT() {
 }
 
 template<typename TensorLayout, typename TensorEngine>
-void print_ten(cute::Tensor<TensorEngine, TensorLayout> tens) {
+CUTE_HOST_DEVICE void print_ten(cute::Tensor<TensorEngine, TensorLayout> tens) {
     // cute::print_layout(tens.layout());
 
     for (size_t m{0}; m < cute::size<0>(tens); ++m) {
-        std::cout << "[ ";
+        printf("[ ");
         for (size_t n{0}; n < cute::size<1>(tens); ++n) {
-            std::cout << tens(cute::make_coord(m, n)) << " ";
+            printf("%f", tens(cute::make_coord(m, n)));
+            printf(" ");
         }
-        std::cout << "]\n";
+        printf("]\n");
     }
+}
+
+template<typename TensorLayout, typename TensorEngine>
+CUTE_HOST_DEVICE void print_vec(cute::Tensor<TensorEngine, TensorLayout> tens) {
+    // cute::print_layout(tens.layout());
+
+    printf("[ ");
+    for (size_t m{0}; m < cute::size<0>(tens); ++m) {
+        printf("%f", tens(cute::make_coord(m)));
+        printf(" ");
+    }
+    printf("]\n");
 }
 
 template<
@@ -420,31 +433,13 @@ __global__ static void gemm_2DBT_2DWT_2DTT_vloadT(
     // To access the first cache matrix for warp index 0,2 this is the command
     // tv(make_coord(make_coord(_, make_coord(make_coord(0, 0), make_coord(0, 2))), _))
     // TODO: Add visual description
-    constexpr Layout warp_tv_layout{
-        make_layout(
-            make_shape(
-                make_shape(
-                    Int<THREAD_TILE_SIZE_Y>{},
-                    make_shape(
-                        make_shape(Int<NUM_CACHES_PER_WARP_Y>{}, Int<NUM_CACHES_PER_WARP_X>{}),
-                        make_shape(Int<NUM_THREADS_PER_WARP_Y>{}, Int<NUM_THREADS_PER_WARP_X>{})
-                    )
-                ),
-                Int<THREAD_TILE_SIZE_X>{}
-            ),
-            make_stride(
-                make_stride(
-                    _1{},
-                    make_stride(
-                        make_stride(
-                            Int<THREAD_TILE_SIZE_Y * NUM_THREADS_PER_WARP_Y>{},
-                            Int<THREAD_TILE_SIZE_X * NUM_THREADS_PER_WARP_X * WARP_TILE_SIZE_Y>{}
-                        ),
-                        make_stride(Int<THREAD_TILE_SIZE_Y>{}, Int<THREAD_TILE_SIZE_X * WARP_TILE_SIZE_Y>{}))),
-                Int<WARP_TILE_SIZE_Y>{}
-            )
-        )
-    };
+    constexpr Layout<
+        Shape<Int<NUM_THREADS_PER_WARP_Y>, Int<NUM_THREADS_PER_WARP_X>, Int<NUM_CACHES_PER_WARP_Y>,
+            Int<NUM_CACHES_PER_WARP_X>, Int<THREAD_TILE_SIZE_Y>, Int<THREAD_TILE_SIZE_X>>,
+        Stride<Int<THREAD_TILE_SIZE_Y>, Int<THREAD_TILE_SIZE_X * WARP_TILE_SIZE_Y>,
+            Int<THREAD_TILE_SIZE_Y * NUM_THREADS_PER_WARP_Y>,
+            Int<THREAD_TILE_SIZE_X * WARP_TILE_SIZE_Y * NUM_THREADS_PER_WARP_X>, _1, Int<WARP_TILE_SIZE_Y>>
+    >warp_tv_layout{};
 
     extern __shared__ T shared_memory[];
     constexpr size_t smem_length_A{cosize_v<decltype(smem_A_T_layout)>};
@@ -471,65 +466,52 @@ __global__ static void gemm_2DBT_2DWT_2DTT_vloadT(
     const size_t warp_x_idx{warp_coord.rest_.first_.rest_.first_}; // index of the warp_tile in the block
 
 
-     Tensor block_tile_C{local_tile(global_C, C_block_tiler, make_coord(blockIdx.y, blockIdx.x))};
-     Tensor warp_tile_C{local_tile(block_tile_C, warp_tile, make_coord(warp_y_idx, warp_x_idx))};
-     Tensor tv_warp_tile_C{composition(warp_tile_C, warp_tv_layout)};
-     Tensor C_value{
-         tv_warp_tile_C(make_coord(make_coord(_, make_coord(make_coord(_, _), make_coord(row_in_warp, col_in_warp))), _))
-     };
+    Tensor block_tile_C{local_tile(global_C, C_block_tiler, make_coord(blockIdx.y, blockIdx.x))};
+    Tensor warp_tile_C{local_tile(block_tile_C, warp_tile, make_coord(warp_y_idx, warp_x_idx))};
 
-     Tensor rmem_A_cache{
-         make_tensor<T>(
-             make_shape(Int<NUM_CACHES_PER_WARP_Y>(), Int<THREAD_TILE_SIZE_Y>()),
-             LayoutRight{}
-         )
-     };
+    Tensor tv_warp_tile_C{composition(warp_tile_C, warp_tv_layout)};
+    Tensor C_value{
+        tv_warp_tile_C(row_in_warp, col_in_warp, _, _, _, _)
+    };
 
-     Tensor rmem_B_cache{
-         make_tensor<T>(
-             make_shape(Int<NUM_CACHES_PER_WARP_X>(), Int<THREAD_TILE_SIZE_X>()),
-             LayoutRight{}
-         )
-     };
+    Tensor rmem_A_cache{
+        make_tensor<T>(
+            Shape<Int<NUM_CACHES_PER_WARP_Y>, Int<THREAD_TILE_SIZE_Y>>{},
+            LayoutRight{}
+        )
+    };
 
-     Tensor rmem_cache_intermediates{
-         make_tensor<T>(
-             make_shape(
-                 make_shape(
-                     Int<THREAD_TILE_SIZE_Y>{},
-                     make_shape(Int<NUM_CACHES_PER_WARP_Y>{}, Int<NUM_CACHES_PER_WARP_X>{})
-                 ),
-                 Int<THREAD_TILE_SIZE_X>{}
-             ),
-             make_stride(
-                 make_stride(
-                     Int<THREAD_TILE_SIZE_X * NUM_CACHES_PER_WARP_X>{},
-                     make_stride(Int<THREAD_TILE_SIZE_X * NUM_CACHES_PER_WARP_X * THREAD_TILE_SIZE_Y>{},
-                                 Int<THREAD_TILE_SIZE_X>{})
-                 ),
-                 _1{}
-             )
-         )
-     };
+    Tensor rmem_B_cache{
+        make_tensor<T>(
+            Shape<Int<NUM_CACHES_PER_WARP_X>, Int<THREAD_TILE_SIZE_X>>{},
+            LayoutRight{}
+        )
+    };
 
-     for (size_t iter{0}; iter < total_iters; ++iter) {
-         // same as zipped divide w/ less code
-         Tensor tile_A{local_tile(global_A, A_block_tiler, make_coord(blockIdx.y, iter))};
-         Tensor tile_B{local_tile(global_B, smem_B_layout.shape(), make_coord(iter, blockIdx.x))};
+    Tensor rmem_cache_intermediates{
+        make_tensor<T>(
+            Shape<Int<NUM_CACHES_PER_WARP_Y>, Int<NUM_CACHES_PER_WARP_X>, Int<THREAD_TILE_SIZE_Y>,
+            Int<THREAD_TILE_SIZE_X>>{},
+            LayoutRight{}
+        )
+    };
 
-         // load to shared
-         // TODO change
-         // load_to_shared(shared_A, shared_B, tile_A, tile_B, thread_layout);
-         __syncthreads();
+    for (size_t iter{0}; iter < total_iters; ++iter) {
+        Tensor tile_A{local_tile(global_A, A_block_tiler, make_coord(blockIdx.y, iter))};
+        Tensor tile_B{local_tile(global_B, smem_B_layout.shape(), make_coord(iter, blockIdx.x))};
 
-         Tensor warp_tile_A{
-             local_tile(shared_A, make_shape(Int<BLOCK_TILE_SIZE_K>{}, Int<WARP_TILE_SIZE_Y>{}),
-                        make_coord(0, warp_y_idx))
-         };
-         Tensor warp_tile_B{
-             local_tile(shared_B, make_shape(Int<BLOCK_TILE_SIZE_K>{}, Int<WARP_TILE_SIZE_X>{}),
-                        make_coord(0, warp_x_idx))
-         };
+        // TODO change
+        // load_to_shared(shared_A, shared_B, tile_A, tile_B, thread_layout);
+        __syncthreads();
+
+        Tensor warp_tile_A{
+            local_tile(shared_A, make_shape(Int<BLOCK_TILE_SIZE_K>{}, Int<WARP_TILE_SIZE_Y>{}),
+                       make_coord(0, warp_y_idx))
+        };
+        Tensor warp_tile_B{
+            local_tile(shared_B, make_shape(Int<BLOCK_TILE_SIZE_K>{}, Int<WARP_TILE_SIZE_X>{}),
+                       make_coord(0, warp_x_idx))
+        };
 
 #pragma unroll
         for (size_t kk{0}; kk < BLOCK_TILE_SIZE_K; ++kk) {
@@ -539,28 +521,26 @@ __global__ static void gemm_2DBT_2DWT_2DTT_vloadT(
             Tensor slice_warp_A_tv{composition(slice_warp_tile_A, warp_slice_tile_A)};
             Tensor slice_warp_B_tv{composition(slice_warp_tile_B, warp_slice_tile_B)};
 
-            copy(rmem_A_cache, slice_warp_A_tv(make_coord(make_coord(row_in_warp, _), _)));
-            copy(rmem_B_cache, slice_warp_B_tv(make_coord(make_coord(col_in_warp, _), _)));
+            copy(slice_warp_A_tv(make_coord(row_in_warp, _), _), rmem_A_cache);
+            copy(slice_warp_B_tv(make_coord(col_in_warp, _), _), rmem_B_cache);
 
             for (size_t rmem_cache_idxA{0}; rmem_cache_idxA < NUM_CACHES_PER_WARP_Y; ++rmem_cache_idxA) {
                 for (size_t rmem_cache_idxB{0}; rmem_cache_idxB < NUM_CACHES_PER_WARP_X; ++rmem_cache_idxB) {
-                    Tensor A_cache_slice{rmem_A_cache(make_coord(_, rmem_cache_idxA))};
-                    Tensor B_cache_slice{rmem_B_cache(make_coord(_, rmem_cache_idxB))};
-                    Tensor partials{
-                        rmem_cache_intermediates(make_coord(make_coord(_, make_coord(rmem_cache_idxA, rmem_cache_idxB)), _))
-                    };
+                    Tensor A_cache_slice{rmem_A_cache(rmem_cache_idxA, _)};
+                    Tensor B_cache_slice{rmem_B_cache(rmem_cache_idxB, _)};
+                    Tensor partials{rmem_cache_intermediates(rmem_cache_idxA, rmem_cache_idxB, _, _)};
 
                     for (size_t i{0}; i < THREAD_TILE_SIZE_Y; ++i) {
                         T acs{A_cache_slice(i)};
                         for (size_t j{0}; j < THREAD_TILE_SIZE_X; ++j) {
-                            partials(make_coord(i, j)) = acs * B_cache_slice(j);
+                            partials(i, j) += acs * B_cache_slice(j);
                         }
                     }
                 }
             }
         }
-         __syncthreads();
-     }
+        __syncthreads();
+    }
 
      axpby(alpha, rmem_cache_intermediates, beta, C_value);
 }
@@ -571,13 +551,13 @@ void test_cute_gemm_2DBT_2DWT_2DTT_vloadT() {
 
     constexpr size_t M{128};
     constexpr size_t N{128};
-    constexpr size_t K{256};
+    constexpr size_t K{16};
 
     constexpr size_t BLOCK_TILE_SIZE_X{128};
     constexpr size_t BLOCK_TILE_SIZE_Y{128};
     constexpr size_t BLOCK_TILE_SIZE_K{16};
 
-    constexpr size_t WARP_TILE_SIZE_X{32};
+    constexpr size_t WARP_TILE_SIZE_X{64};
     constexpr size_t WARP_TILE_SIZE_Y{64};
 
     static_assert((M * K) % (BLOCK_TILE_SIZE_Y * BLOCK_TILE_SIZE_K) == 0);
@@ -606,24 +586,28 @@ void test_cute_gemm_2DBT_2DWT_2DTT_vloadT() {
     thrust::host_vector<float> host_matrixB(K * N);
     thrust::host_vector<float> host_matrixC(M * N);
 
+    fill_matrix_w(host_matrixA.data(), M, K, K, -100, 100);
+    fill_matrix_w(host_matrixB.data(), K, N, N, -100, 100);
+    for (size_t i{0}; i < N * M; ++i) host_matrixC[i] = static_cast<float>(i);
+
     thrust::device_vector<float> d_matrixA{host_matrixA};
     thrust::device_vector<float> d_matrixB{host_matrixB};
     thrust::device_vector<float> d_matrixC{host_matrixC};
-
-    fill_matrix_w(host_matrixA.data(), M, K, K, -100, 100);
-    fill_matrix_w(host_matrixB.data(), K, N, N, -100, 100);
-    for (size_t i{0}; i < N * M; ++i) host_matrixC[i] = 0.f;
 
     dim3 grid_dim{
         ceil_div(N, BLOCK_TILE_SIZE_X),
         ceil_div(M, BLOCK_TILE_SIZE_Y)
     };
 
+    constexpr size_t shared_mem_size{
+        ((BLOCK_TILE_SIZE_Y * BLOCK_TILE_SIZE_K) + (BLOCK_TILE_SIZE_K * BLOCK_TILE_SIZE_X)) * sizeof(float)
+    };
+
     gemm_2DBT_2DWT_2DTT_vloadT<
         float,
-        Layout<Shape<Int<M>, Int<K>>, Stride<Int<K>, _1>>,
-        Layout<Shape<Int<K>, Int<N>>, Stride<Int<N>, _1>>,
-        Layout<Shape<Int<M>, Int<N>>, Stride<Int<N>, _1>>,
+        Layout<Shape<Int<M>, Int<K> >, Stride<Int<K>, _1> >,
+        Layout<Shape<Int<K>, Int<N> >, Stride<Int<N>, _1> >,
+        Layout<Shape<Int<M>, Int<N> >, Stride<Int<N>, _1> >,
         BLOCK_TILE_SIZE_X,
         BLOCK_TILE_SIZE_Y,
         BLOCK_TILE_SIZE_K,
@@ -633,14 +617,14 @@ void test_cute_gemm_2DBT_2DWT_2DTT_vloadT() {
         THREAD_TILE_SIZE_Y,
         NUM_THREADS_PER_WARP_X,
         NUM_THREADS_PER_WARP_Y
-        ><<<grid_dim, THREADS_PER_BLOCK>>>(
-            d_matrixA.data().get(),
-            d_matrixB.data().get(),
-            d_matrixC.data().get(),
-            make_layout(make_shape(Int<M>{}, Int<K>{}), LayoutRight{}),
-            make_layout(make_shape(Int<K>{}, Int<N>{}), LayoutRight{}),
-            make_layout(make_shape(Int<M>{}, Int<N>{}), LayoutRight{}),
-            1.f,
-            1.f
-        );
+    ><<<grid_dim, THREADS_PER_BLOCK, shared_mem_size>>>(
+        d_matrixA.data().get(),
+        d_matrixB.data().get(),
+        d_matrixC.data().get(),
+        make_layout(make_shape(Int<M>{}, Int<K>{}), LayoutRight{}),
+        make_layout(make_shape(Int<K>{}, Int<N>{}), LayoutRight{}),
+        make_layout(make_shape(Int<M>{}, Int<N>{}), LayoutRight{}),
+        1.f,
+        0.f
+    );
 }
