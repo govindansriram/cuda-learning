@@ -544,11 +544,11 @@ __global__ static void gemm_2DBT_2DWT_2DTT_vloadT(
         load_to_shared_transposed(shared_A, shared_B, tile_A, tile_B, thread_layout, static_cast<T>(0), float4{0, 0, 0, 0});
         __syncthreads();
 
-        if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
-            print_ten(tile_B);
-            printf("\n");
-            print_ten(shared_B);
-        }
+        // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
+        //     print_ten(tile_B);
+        //     printf("\n");
+        //     print_ten(shared_B);
+        // }
 
         Tensor warp_tile_A{
             local_tile(shared_A, make_shape(Int<BLOCK_TILE_SIZE_K>{}, Int<WARP_TILE_SIZE_Y>{}),
@@ -631,6 +631,7 @@ void test_cute_gemm_2DBT_2DWT_2DTT_vloadT() {
     thrust::host_vector<float> host_matrixA(M * K);
     thrust::host_vector<float> host_matrixB(K * N);
     thrust::host_vector<float> host_matrixC(M * N);
+    thrust::host_vector<float> host_matrixC3(M * N);
 
     fill_matrix_w(host_matrixA.data(), M, K, K, -100, 100);
     fill_matrix_w(host_matrixB.data(), K, N, N, -100, 100);
@@ -673,4 +674,8 @@ void test_cute_gemm_2DBT_2DWT_2DTT_vloadT() {
         1.f,
         0.f
     );
+
+    thrust::host_vector<float> host_matrixC2{d_matrixC};
+    cpu_matmul_naive(host_matrixA.data(), host_matrixB.data(), host_matrixC3.data(), M, N, K, K, N, N);
+    test_equivalency(host_matrixC3.data(), host_matrixC2.data(), M, N, N);
 }
