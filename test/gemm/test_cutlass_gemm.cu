@@ -74,71 +74,6 @@ CUTE_DEVICE void load_to_shared(
     copy(global_B_value, shared_B_value);
 }
 
-
-template<
-    typename A_GLOBAL_LAYOUT,
-    typename A_GLOBAL_ENGINE,
-    typename A_SHARED_T_LAYOUT,
-    typename A_SHARED_T_ENGINE,
-    typename B_GLOBAL_LAYOUT,
-    typename B_GLOBAL_ENGINE,
-    typename B_SHARED_LAYOUT,
-    typename B_SHARED_ENGINE,
-    typename THREAD_LAYOUT
->
-CUTE_DEVICE void load_to_shared_transposed(
-    const cute::Tensor<A_SHARED_T_ENGINE, A_SHARED_T_LAYOUT> &shared_A_transposed,
-    const cute::Tensor<B_SHARED_ENGINE, B_SHARED_LAYOUT> &shared_B,
-    const cute::Tensor<A_GLOBAL_ENGINE, A_GLOBAL_LAYOUT> &global_A,
-    const cute::Tensor<B_GLOBAL_ENGINE, B_GLOBAL_LAYOUT> &global_B,
-    const THREAD_LAYOUT &thread_layout
-) {
-    using namespace cute;
-
-    constexpr size_t smem_length_A{cosize_v<A_SHARED_T_LAYOUT>};
-    constexpr size_t smem_length_B{cosize_v<B_SHARED_LAYOUT>};
-    constexpr size_t thread_length{cosize_v<THREAD_LAYOUT>};
-
-    static_assert(smem_length_A % thread_length == 0);
-    static_assert(smem_length_B % thread_length == 0);
-    static_assert(size<0>(A_GLOBAL_LAYOUT{}) == size<1>(A_SHARED_T_LAYOUT{}));
-    static_assert(size<1>(A_GLOBAL_LAYOUT{}) == size<0>(A_SHARED_T_LAYOUT{}));
-    static_assert(size<0>(B_GLOBAL_LAYOUT{}) == size<0>(B_SHARED_LAYOUT{}));
-    static_assert(size<1>(B_GLOBAL_LAYOUT{}) == size<1>(B_SHARED_LAYOUT{}));
-
-    constexpr size_t A_loads_per_thread{smem_length_A / thread_length};
-    constexpr size_t B_loads_per_thread{smem_length_B / thread_length};
-
-    constexpr auto tv_layout_A{
-        make_layout(
-            make_shape(make_shape(size<1>(A_GLOBAL_LAYOUT{}),
-                                  size<0>(A_GLOBAL_LAYOUT{}) / A_loads_per_thread), A_loads_per_thread),
-            make_stride(make_stride(size<0>(A_GLOBAL_LAYOUT{}), A_loads_per_thread), _1{}))
-    };
-
-    constexpr auto tv_layout_B{
-        make_layout(
-            make_shape(
-                make_shape(size<1>(B_GLOBAL_LAYOUT{}), size<0>(B_GLOBAL_LAYOUT{}) / B_loads_per_thread),
-                B_loads_per_thread),
-            make_stride(make_stride(size<0>(B_GLOBAL_LAYOUT{}), B_loads_per_thread), _1{}))
-    };
-
-    Tensor shared_A_tv{composition(shared_A_transposed, tv_layout_A)};
-    Tensor shared_B_tv{composition(shared_B, tv_layout_B)};
-    const Tensor global_A_tv{composition(global_A, tv_layout_A)};
-    const Tensor global_B_tv{composition(global_B, tv_layout_B)};
-
-    const Tensor global_A_value{global_A_tv(threadIdx.x, _)};
-    Tensor shared_A_value{shared_A_tv(threadIdx.x, _)};
-
-    const Tensor global_B_value{global_B_tv(threadIdx.x, _)};
-    Tensor shared_B_value{shared_B_tv(threadIdx.x, _)};
-
-    copy(global_A_value, shared_A_value);
-    copy(global_B_value, shared_B_value);
-}
-
 template<
     typename T,
     typename A_GLOBAL_LAYOUT,
@@ -322,6 +257,121 @@ CUTE_HOST_DEVICE void print_vec(cute::Tensor<TensorEngine, TensorLayout> tens) {
     printf("]\n");
 }
 
+template<typename TENSOR_LAYOUT>
+constexpr CUTE_HOST_DEVICE auto to_layout_left(TENSOR_LAYOUT layout) {
+    using namespace cute;
+
+    static_assert(cute::rank_v<TENSOR_LAYOUT> == 2);
+
+    if constexpr (size<0>(TENSOR_LAYOUT{}) > size<1>(TENSOR_LAYOUT{})) {
+        constexpr auto layout_left{
+            make_layout(
+                make_shape(
+                    make_shape(size<1>(TENSOR_LAYOUT{}), size<0>(TENSOR_LAYOUT{}) / size<1>(TENSOR_LAYOUT{})),
+                    size<1>(TENSOR_LAYOUT{})
+                ),
+                make_stride(
+                    make_stride(size<0>(TENSOR_LAYOUT{}), _1{}),
+                    size<0>(TENSOR_LAYOUT{}) / size<1>(TENSOR_LAYOUT{})
+                )
+            )
+        };
+
+        return layout_left;
+    }else {
+        constexpr auto layout_left{
+            make_layout(
+                make_shape(
+                    size<0>(TENSOR_LAYOUT{}),
+                    make_shape(size<1>(TENSOR_LAYOUT{}) / size<0>(TENSOR_LAYOUT{}), size<0>(TENSOR_LAYOUT{}))
+                ),
+                make_stride(
+                    size<0>(TENSOR_LAYOUT{}),
+                    make_stride(size<0>(TENSOR_LAYOUT{}) * size<0>(TENSOR_LAYOUT{}), _1{})
+                )
+            )
+        };
+
+        return layout_left;
+    }
+}
+
+template<
+    typename BASE_TYPE,
+    typename LOAD_TYPE,
+    typename A_GLOBAL_LAYOUT,
+    typename A_GLOBAL_ENGINE,
+    typename A_SHARED_T_LAYOUT,
+    typename A_SHARED_T_ENGINE,
+    typename B_GLOBAL_LAYOUT,
+    typename B_GLOBAL_ENGINE,
+    typename B_SHARED_LAYOUT,
+    typename B_SHARED_ENGINE,
+    typename THREAD_LAYOUT
+>
+CUTE_DEVICE void load_to_shared_transposed(
+    const cute::Tensor<A_SHARED_T_ENGINE, A_SHARED_T_LAYOUT> &shared_A_transposed,
+    const cute::Tensor<B_SHARED_ENGINE, B_SHARED_LAYOUT> &shared_B,
+    const cute::Tensor<A_GLOBAL_ENGINE, A_GLOBAL_LAYOUT> &global_A,
+    const cute::Tensor<B_GLOBAL_ENGINE, B_GLOBAL_LAYOUT> &global_B,
+    const THREAD_LAYOUT thread_layout,
+    const BASE_TYPE base_type,
+    const LOAD_TYPE load_type
+) {
+    using namespace cute;
+
+    static_assert(sizeof(LOAD_TYPE) % sizeof(BASE_TYPE) == 0);
+    constexpr size_t units_per_load{sizeof(LOAD_TYPE) / sizeof(BASE_TYPE)};
+
+    constexpr size_t smem_length_A{cosize_v<A_SHARED_T_LAYOUT>};
+    constexpr size_t smem_length_B{cosize_v<B_SHARED_LAYOUT>};
+    constexpr size_t thread_length{cosize_v<THREAD_LAYOUT>};
+
+    static_assert(smem_length_A / units_per_load % thread_length == 0);
+    static_assert(smem_length_B / units_per_load % thread_length == 0);
+    static_assert(size<0>(A_GLOBAL_LAYOUT{}) == size<1>(A_SHARED_T_LAYOUT{}));
+    static_assert(size<1>(A_GLOBAL_LAYOUT{}) == size<0>(A_SHARED_T_LAYOUT{}));
+    static_assert(size<0>(B_GLOBAL_LAYOUT{}) == size<0>(B_SHARED_LAYOUT{}));
+    static_assert(size<1>(B_GLOBAL_LAYOUT{}) == size<1>(B_SHARED_LAYOUT{}));
+
+    constexpr size_t A_loads_per_thread{smem_length_A / units_per_load / thread_length};
+    constexpr size_t B_loads_per_thread{smem_length_B / units_per_load / thread_length};
+
+    constexpr Layout layout_left_A{to_layout_left(A_GLOBAL_LAYOUT{})};
+    const Tensor left_global_A{coalesce(composition(global_A, layout_left_A))};
+
+    constexpr auto tv_layout_A{
+        make_layout(
+            make_shape(thread_length, make_shape(Int<units_per_load>{}, Int<A_loads_per_thread>{})),
+            make_stride(Int<A_loads_per_thread>{}, make_stride(_1{}, Int<thread_length * units_per_load>{}))
+        )
+    };
+
+    Tensor tv_left_global_A{composition(left_global_A, tv_layout_A)};
+    Tensor shared_A_coalesced{coalesce(shared_A_transposed)};
+    Tensor tv_shared_A{composition(shared_A_coalesced, tv_layout_A)};
+
+    copy(tv_left_global_A(threadIdx.x, _), tv_shared_A(threadIdx.x, _));
+
+    constexpr Layout layout_left_B{to_layout_left(B_GLOBAL_LAYOUT{})};
+    constexpr Layout layout_left_B_shared{to_layout_left(B_SHARED_LAYOUT{})};
+    const Tensor left_global_B{coalesce(composition(global_B, layout_left_B))};
+    const Tensor left_shared_B{coalesce(composition(shared_B, layout_left_B_shared))};
+
+
+    constexpr auto tv_layout_B{
+        make_layout(
+            make_shape(thread_length, make_shape(Int<units_per_load>{}, Int<B_loads_per_thread>{})),
+            make_stride(Int<B_loads_per_thread>{}, make_stride(_1{}, Int<thread_length * units_per_load>{}))
+        )
+    };
+
+    Tensor tv_left_global_B{composition(left_global_B, tv_layout_B)};
+    Tensor tv_shared_B{composition(left_shared_B, tv_layout_B)};
+
+    copy(tv_left_global_B(threadIdx.x, _), tv_shared_B(threadIdx.x, _));
+}
+
 template<
     typename T,
     typename A_GLOBAL_LAYOUT,
@@ -424,22 +474,13 @@ __global__ static void gemm_2DBT_2DWT_2DTT_vloadT(
     // THREAD_TILE_SIZE_Y * THREAD_TILE_SIZE_X, matrices since that is what each thread is supposed to compute
     // however in the scenario where threads are responsible to compute multiple tiles (NUM_CACHES_PER_WARP) is greater
     // than 1 then we also group those matrices near each other for easy indexing
-    //
-    // the layout is organized as a high dimensional matrix. The first dimension is THREAD_TILE_SIZE_Y, as this is the
-    // row length of the matrices, this gets repeated NUM_CACHES_PER_WARP_X * NUM_CACHES_PER_WARP_Y times since that
-    // rows of matrices are being computed, the next coord pair correlate the cluster of matrices to the appropriate
-    // warp idx pair
-    // Finally the last idx specifies the length of each row which is THREAD_TILE_SIZE_X
-    // To access the first cache matrix for warp index 0,2 this is the command
-    // tv(make_coord(make_coord(_, make_coord(make_coord(0, 0), make_coord(0, 2))), _))
-    // TODO: Add visual description
     constexpr Layout<
         Shape<Int<NUM_THREADS_PER_WARP_Y>, Int<NUM_THREADS_PER_WARP_X>, Int<NUM_CACHES_PER_WARP_Y>,
-            Int<NUM_CACHES_PER_WARP_X>, Int<THREAD_TILE_SIZE_Y>, Int<THREAD_TILE_SIZE_X>>,
+            Int<NUM_CACHES_PER_WARP_X>, Int<THREAD_TILE_SIZE_Y>, Int<THREAD_TILE_SIZE_X> >,
         Stride<Int<THREAD_TILE_SIZE_Y>, Int<THREAD_TILE_SIZE_X * WARP_TILE_SIZE_Y>,
             Int<THREAD_TILE_SIZE_Y * NUM_THREADS_PER_WARP_Y>,
-            Int<THREAD_TILE_SIZE_X * WARP_TILE_SIZE_Y * NUM_THREADS_PER_WARP_X>, _1, Int<WARP_TILE_SIZE_Y>>
-    >warp_tv_layout{};
+            Int<THREAD_TILE_SIZE_X * WARP_TILE_SIZE_Y * NUM_THREADS_PER_WARP_X>, _1, Int<WARP_TILE_SIZE_Y> >
+    > warp_tv_layout{};
 
     extern __shared__ T shared_memory[];
     constexpr size_t smem_length_A{cosize_v<decltype(smem_A_T_layout)>};
@@ -476,14 +517,14 @@ __global__ static void gemm_2DBT_2DWT_2DTT_vloadT(
 
     Tensor rmem_A_cache{
         make_tensor<T>(
-            Shape<Int<NUM_CACHES_PER_WARP_Y>, Int<THREAD_TILE_SIZE_Y>>{},
+            Shape<Int<NUM_CACHES_PER_WARP_Y>, Int<THREAD_TILE_SIZE_Y> >{},
             LayoutRight{}
         )
     };
 
     Tensor rmem_B_cache{
         make_tensor<T>(
-            Shape<Int<NUM_CACHES_PER_WARP_X>, Int<THREAD_TILE_SIZE_X>>{},
+            Shape<Int<NUM_CACHES_PER_WARP_X>, Int<THREAD_TILE_SIZE_X> >{},
             LayoutRight{}
         )
     };
@@ -491,7 +532,7 @@ __global__ static void gemm_2DBT_2DWT_2DTT_vloadT(
     Tensor rmem_cache_intermediates{
         make_tensor<T>(
             Shape<Int<NUM_CACHES_PER_WARP_Y>, Int<NUM_CACHES_PER_WARP_X>, Int<THREAD_TILE_SIZE_Y>,
-            Int<THREAD_TILE_SIZE_X>>{},
+                Int<THREAD_TILE_SIZE_X> >{},
             LayoutRight{}
         )
     };
@@ -500,9 +541,14 @@ __global__ static void gemm_2DBT_2DWT_2DTT_vloadT(
         Tensor tile_A{local_tile(global_A, A_block_tiler, make_coord(blockIdx.y, iter))};
         Tensor tile_B{local_tile(global_B, smem_B_layout.shape(), make_coord(iter, blockIdx.x))};
 
-        // TODO change
-        // load_to_shared(shared_A, shared_B, tile_A, tile_B, thread_layout);
+        load_to_shared_transposed(shared_A, shared_B, tile_A, tile_B, thread_layout, static_cast<T>(0), float4{0, 0, 0, 0});
         __syncthreads();
+
+        if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
+            print_ten(tile_B);
+            printf("\n");
+            print_ten(shared_B);
+        }
 
         Tensor warp_tile_A{
             local_tile(shared_A, make_shape(Int<BLOCK_TILE_SIZE_K>{}, Int<WARP_TILE_SIZE_Y>{}),
@@ -542,16 +588,16 @@ __global__ static void gemm_2DBT_2DWT_2DTT_vloadT(
         __syncthreads();
     }
 
-     axpby(alpha, rmem_cache_intermediates, beta, C_value);
+    axpby(alpha, rmem_cache_intermediates, beta, C_value);
 }
 
 
 void test_cute_gemm_2DBT_2DWT_2DTT_vloadT() {
     using namespace cute;
 
-    constexpr size_t M{128};
-    constexpr size_t N{128};
-    constexpr size_t K{16};
+    constexpr size_t M{1024};
+    constexpr size_t N{1024};
+    constexpr size_t K{512};
 
     constexpr size_t BLOCK_TILE_SIZE_X{128};
     constexpr size_t BLOCK_TILE_SIZE_Y{128};
